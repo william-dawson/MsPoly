@@ -5,7 +5,7 @@
 !> dense solvers scale poorly on a single process row or column, so the
 !> shape of the matrix grid does not carry over.
 module msp_eigen_mod
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
   use, intrinsic :: iso_c_binding, only: c_int, c_int64_t, c_double, &
        & c_double_complex, c_char
   use mpi_f08, only: MPI_Comm, MPI_Bcast, MPI_CHARACTER, MPI_Comm_compare, &
@@ -33,7 +33,6 @@ module msp_eigen_mod
      end function msp_scalar_function
   end interface
 
-#:if defined('MSPOLY_SCALAPACK')
   interface
      integer function sys2blacs_handle(comm)
        integer, intent(in) :: comm
@@ -100,8 +99,7 @@ module msp_eigen_mod
        integer, intent(out) :: info
      end subroutine pzheevd
   end interface
-#:endif
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
   interface
      !> Fill id with a new NCCL unique id. Returns nonzero on failure.
      integer(c_int) function cusolvermp_id(id) bind(c, name="msp_cusolvermp_id")
@@ -163,7 +161,7 @@ module msp_eigen_mod
      real(dp), dimension(:, :), allocatable :: ar, zr
      complex(dp), dimension(:, :), allocatable :: ac, zc
   end type cyclic_t
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
 
   !> An open cuSOLVERMp context for the process grid of comm (a duplicate)
   !> with rows x cols processes.
@@ -182,7 +180,7 @@ contains
   !> Release what the dense backends keep between calls (the cuSOLVERMp
   !> contexts). Collective over every grid used with them.
   subroutine msp_dense_release()
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
     integer :: k
 
     if (.not. allocated(contexts)) return
@@ -199,11 +197,9 @@ contains
     character(*), intent(in) :: backend
 
     select case (backend)
-#:if defined('MSPOLY_SCALAPACK')
     case ("scalapack")
        msp_dense_available = .true.
-#:endif
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
     case ("cusolvermp")
        msp_dense_available = .true.
 #:endif
@@ -422,12 +418,10 @@ contains
     call to_cyclic(A, block, c)
     allocate(w(A%n))
     select case (backend)
-#:if defined('MSPOLY_SCALAPACK')
     case ("scalapack")
        call msp_cite("blackford1997scalapack", info)
        call scalapack_eigh(A, c, w, present(vectors))
-#:endif
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
     case ("cusolvermp")
        call msp_cite("nvidia_cusolvermp", info)
        call cusolvermp_eigh(A, c, w, present(vectors))
@@ -592,7 +586,6 @@ contains
     if (A%on_device()) call msp_to_device(V)
   end subroutine from_cyclic
 
-#:if defined('MSPOLY_SCALAPACK')
   !> w and the eigenvectors in c from ScaLAPACK's divide and conquer
   !> solver, or w alone from its eigenvalue-only solver (p?syevd and
   !> p?heevd accept only jobz = 'V'), when the eigenvectors are not wanted.
@@ -654,9 +647,8 @@ contains
     call free_blacs_system_handle(handle)
     if (status /= 0) call msp_raise("msp_eigen: ScaLAPACK failed")
   end subroutine scalapack_eigh
-#:endif
 
-#:if defined('MSPOLY_CUSOLVERMP')
+#:if defined('MSPOLY_GPU')
   !> w, and the eigenvectors in c when wanted, from cuSOLVERMp's divide
   !> and conquer solver on the GPUs. Collective.
   subroutine cusolvermp_eigh(A, c, w, wanted)

@@ -27,7 +27,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           -DCMAKE_Fortran_COMPILER=gfortran-${{ matrix.version }}
           -DFYPP=$(command -v fypp) -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe
-          -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi
+          -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi
       - name: Build
         run: cmake --build build -j 4
       - name: Test
@@ -49,7 +49,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_Fortran_COMPILER=gfortran-14 -DFYPP=$(command -v fypp) \
             -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe \
-            -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi \
+            -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi \
             -DCMAKE_Fortran_FLAGS="-pedantic -Werror"
           cmake --build build -j 4
       - name: Test
@@ -93,10 +93,11 @@ jobs:
             options="-DCMAKE_BUILD_TYPE=$build"
             if [ $build = GPU ]; then
               options="-DCMAKE_BUILD_TYPE=Release -DMSPOLY_GPU=ON -DMSPOLY_BUILD_BENCH=ON
-                -DMSPOLY_CUSOLVERMP=ON -DCMAKE_PREFIX_PATH=$math;$nccl"
+                -DCMAKE_PREFIX_PATH=$math;$nccl"
             fi
             cmake -S . -B build-$build $options \
               -DCMAKE_Fortran_COMPILER=nvfortran -DFYPP=/opt/fypp/bin/fypp \
+              -DMSPOLY_SCALAPACK_LIBRARIES=-Mscalapack \
               -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe
             cmake --build build-$build -j 4 2>&1 | tee build-$build.log
             test ${PIPESTATUS[0]} -eq 0
@@ -137,7 +138,7 @@ jobs:
           FC: gfortran-14
         run: |
           tools/coverage.sh build-coverage -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe \
-            -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi | tee coverage.txt
+            -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi | tee coverage.txt
           {
             echo "### Line coverage"
             echo '```'

@@ -3,8 +3,10 @@
 !> eigenvalues, eigenvectors (orthonormal, and only the first nvals
 !> columns), single precision, a matrix smaller than the process grid, and
 !> matrix functions U f(D) U^H, directly and as the dense method of each
-!> matrix function, Fermi-Dirac density matrices and singular value
-!> decompositions. Real and complex; run on 1, 2 and 4 ranks. With the
+!> matrix function (square roots and general roots, inverse and
+!> pseudo-inverse, sign and polar decomposition, exponential, logarithm,
+!> sine and cosine, polynomials), density matrices, Fermi-Dirac density
+!> matrices and singular value decompositions. Real and complex; run on 1, 2 and 4 ranks. With the
 !> argument "device", inputs are moved to the GPU. The other arguments name
 !> calls that must stop the program: a backend that is not built in
 !> ("backend"), eigenvalues outside the domain of the function ("domain"),
@@ -19,8 +21,11 @@ program test_eigen
   use msp_eigen_mod, only: msp_eigen, msp_dense_function, &
        & msp_dense_available, msp_dense_release
   use msp_sqrt_mod, only: msp_sqrt, msp_inverse_sqrt, sqrt_impl
-  use msp_inverse_mod, only: msp_inverse
-  use msp_sign_mod, only: msp_sign
+  use msp_inverse_mod, only: msp_inverse, msp_root, msp_inverse_root, &
+       & msp_pseudo_inverse
+  use msp_sign_mod, only: msp_sign, msp_polar
+  use msp_polynomial_mod, only: msp_polynomial
+  use msp_density_mod, only: msp_density
   use msp_exponential_mod, only: msp_exp, msp_log
   use msp_trigonometry_mod, only: msp_sin, msp_cos, trigonometry_impl
   use msp_fermi_mod, only: msp_fermi
@@ -170,14 +175,15 @@ contains
     character(*), intent(in) :: backend
     logical, intent(in) :: cplx
     character(:), allocatable :: label
-    type(msp_matrix) :: a, x, y, left, right, lh, product
+    type(msp_matrix) :: a, x, y, left, right, lh, product, s, ks, ksk
     type(msp_dict) :: args
     type(msp_dict), target :: tracked, info
     type(msp_args) :: a_args
     type(msp_info) :: r
     real(dp), dimension(:), allocatable :: values
-    real(dp), dimension(n) :: d, p, f
-    real(dp) :: mu, low, high
+    real(dp), dimension(n) :: d, p, f, dz, flip
+    complex(dp), dimension(n, n) :: unitary, positive
+    real(dp) :: mu, low, high, tr
     integer :: step
 
     label = backend // merge(" complex", " real   ", cplx)
@@ -252,6 +258,74 @@ contains
          & sum(d(1:6))) < 1.0e-12_dp .and. &
          & abs(info%get_real("chemical_potential") - (d(6) + d(7)) / 2) < &
          & 1.0e-12_dp, label // ": dense density matrix, zero temperature")
+
+    call msp_density(a, x, args, info)
+    call check(matches(x, f, cplx) .and. info%get_logical("converged") .and. &
+         & abs(info%get_real("energy") - sum(d(1:6))) < 1.0e-12_dp, label // &
+         & ": dense density matrix")
+    !! With an overlap the density matrix is the projector K S, so
+    !! K S K = K and tr(K S) is the trace.
+    call distribute(y, spectrum(d, cplx, 0.4_dp, 1.9_dp), grid, cplx, device)
+    call make_matrix(s, p, cplx)
+    call args%set("inverse_sqrt.method", "dense")
+    call args%set("inverse_sqrt.backend", backend)
+    call msp_density(y, x, args, info, overlap=s)
+    call msp_multiply(x, s, ks)
+    call msp_multiply(ks, x, ksk)
+    call msp_add(ksk, x, alpha=-1.0_dp)
+    call msp_trace(ks, tr)
+    call check(msp_norm(ksk) < 1.0e-9_dp .and. abs(tr - 6) < 1.0e-9_dp, &
+         & label // ": dense density matrix with an overlap")
+    call args%remove("inverse_sqrt")
+
+    call make_matrix(a, p, cplx)
+    call args%set("root", 3)
+    call msp_root(a, x, args, info)
+    call check(matches(x, p**(1.0_dp / 3), cplx), label // ": dense cube root")
+    call msp_inverse_root(a, x, args, info)
+    call check(matches(x, p**(-1.0_dp / 3), cplx), label // &
+         & ": dense inverse cube root")
+    call args%remove("root")
+
+    dz = d
+    dz(4) = 0
+    call make_matrix(a, dz, cplx)
+    dz = 0
+    dz(1:3) = 1 / d(1:3)
+    dz(5:n) = 1 / d(5:n)
+    call msp_pseudo_inverse(a, x, args, info)
+    call check(matches(x, dz, cplx) .and. info%get_int("rank") == n - 1, &
+         & label // ": dense pseudo-inverse")
+
+    !! A = R P with R a reflection and P positive definite: its polar
+    !! factors are R and P.
+    flip = 1
+    flip(1) = -1
+    unitary = spectrum(flip, cplx, 0.4_dp, 1.9_dp)
+    positive = spectrum(p, cplx, 1.3_dp, 0.7_dp)
+    call distribute(a, matmul(unitary, positive), grid, cplx, device)
+    call msp_polar(a, x, args, info, h=y)
+    call check(deviation(x, unitary) < 1.0e-9_dp .and. &
+         & deviation(y, positive) < 1.0e-9_dp, label // ": dense polar")
+
+    call make_matrix(a, d, cplx)
+    call args%set("coefficients", [1.0_dp, -2.0_dp, 0.5_dp, 0.25_dp])
+    call msp_polynomial(a, x, args, info)
+    call check(matches(x, 1 - 2 * d + d**2 / 2 + d**3 / 4, cplx), label // &
+         & ": dense polynomial")
+    call args%set("basis", "chebyshev")
+    call msp_polynomial(a, x, args, info)
+    call check(matches(x, 1 - 2 * d + (2 * d**2 - 1) / 2 + &
+         & (4 * d**3 - 3 * d) / 4, cplx), label // &
+         & ": dense Chebyshev polynomial")
+    call args%set("basis", "hermite")
+    call msp_polynomial(a, x, args, info)
+    call check(matches(x, 1 - 4 * d + (4 * d**2 - 2) / 2 + &
+         & (8 * d**3 - 12 * d) / 4, cplx), label // &
+         & ": dense Hermite polynomial")
+    call args%remove("coefficients")
+    call args%remove("basis")
+
     call args%remove("trace")
     call args%remove("method")
 
@@ -272,6 +346,9 @@ contains
     call right%free()
     call lh%free()
     call product%free()
+    call s%free()
+    call ks%free()
+    call ksk%free()
 
   end subroutine test_methods
 

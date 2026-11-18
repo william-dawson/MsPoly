@@ -34,7 +34,6 @@ The options are:
   `scalapack`; separate libraries go in a `;` separated list).
 * `-DMSPOLY_GPU=ON` to compute on NVIDIA GPUs. Point `CMAKE_PREFIX_PATH` at
   cuSOLVERMp and NCCL if they are not in a default location.
-* `-DMSPOLY_BUILD_BENCH=ON` to build the benchmark programs in `bench`.
 
 The libraries are `mspoly_solvers`, `mspoly_matrix` and `mspoly_utils`; link
 all three, and add `build/include` for the module files.
@@ -130,11 +129,11 @@ the input with `msp_to_device(h)`; nothing else changes.
 
 Feature Outline
 --------------------------------------------------------------------------------
-The following functions are implemented, for real and complex matrices, on the
-CPU and the GPU:
+The following functions of a matrix are implemented, for real and complex
+matrices, on the CPU and the GPU:
 
 * Density matrix by purification (`msp_density`: `trs2`, `trs4`, `hpcp`, `pm`),
-  with a generalized overlap matrix, and the energy-weighted density matrix.
+  with a generalized overlap matrix.
 * Square root and inverse square root (`msp_sqrt`, `msp_inverse_sqrt`),
   general roots and inverse roots (`msp_root`, `msp_inverse_root`).
 * Inverse and pseudo-inverse (`msp_inverse`, `msp_pseudo_inverse`).
@@ -142,21 +141,20 @@ CPU and the GPU:
 * Exponential and logarithm (`msp_exp`, `msp_log`).
 * Sine and cosine (`msp_sin`, `msp_cos`).
 * Fermi operator (`msp_fermi`).
-* General polynomials, in monomial or Chebyshev form (`msp_polynomial`).
+* General polynomials, in the monomial, Chebyshev or Hermite basis
+  (`msp_polynomial`).
+
+All of them take `method = "dense"`, which computes the function from the
+eigendecomposition (ScaLAPACK, or cuSOLVERMp on the GPU) instead of by
+polynomial expansion or iteration, for matrices that are too full for the
+sparse methods to pay off.
+
+The following tools are also available:
+
 * Eigenvalue bounds (`msp_bounds`), and HOMO-LUMO gap estimates
   (`msp_estimate_gap`).
 * Linear solvers: conjugate gradient, and Cholesky factorization with pivoting
   (`msp_cg`, `msp_cholesky`, `msp_pivoted_cholesky`).
-* Eigendecomposition, singular value decomposition, and any scalar function
-  of a matrix through them (`msp_eigen`, `msp_svd`, `msp_dense_function`).
-  The square roots, inverse, sign, exponential, logarithm, sine, cosine and
-  Fermi operator also accept `method = "dense"`, which uses the
-  eigendecomposition (ScaLAPACK, or cuSOLVERMp on the GPU) for matrices that
-  are too full for polynomial methods to pay off.
-
-Further Details
---------------------------------------------------------------------------------
-* `docs/design.md` explains the design and the decisions behind it.
-* `tests` shows how each routine is used, and `bench` has timing programs.
-* `tools/compiler-probes/BUGS.md` logs the compiler bugs we have hit and the
-  coding rules they impose. Read it before writing polymorphic code.
+* Eigendecomposition and singular value decomposition (`msp_eigen`,
+  `msp_svd`), and any scalar function of a matrix through the
+  eigendecomposition (`msp_dense_function`).

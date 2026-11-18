@@ -85,8 +85,10 @@ contains
   !> stagnation.
   !>
   !> With method "dense", the sign function of a Hermitian A comes from its
-  !> eigendecomposition instead (args and info as for dense_function_impl);
-  !> the polar factor has no dense method.
+  !> eigendecomposition instead (args and info as for dense_function_impl).
+  !> The polar factor then comes from the eigendecomposition of A^H A, U =
+  !> A (A^H A)^(-1/2), so its accuracy is that of the squared condition
+  !> number of A.
   !>
   !> args: method ("newton_schulz" (default) or "dense"), threshold (scoped,
   !> default 0), tolerance (scoped, default 1e-10), max_iterations (default
@@ -108,8 +110,12 @@ contains
     character(:), allocatable :: reason, method
 
     call args%get("method", method, default="newton_schulz")
-    if (method == "dense" .and. .not. polar) then
-       call dense_function_impl(A, X, sign_of, args, info)
+    if (method == "dense") then
+       if (polar) then
+          call dense_polar(A, X, args, info)
+       else
+          call dense_function_impl(A, X, sign_of, args, info)
+       end if
        return
     else if (method /= "newton_schulz") then
        call msp_raise(merge("msp_polar", "msp_sign ", polar) // &
@@ -169,6 +175,31 @@ contains
     call next%free()
     call id%free()
   end subroutine sign_impl
+
+  !> The unitary polar factor of A, U = A (A^H A)^(-1/2). Collective.
+  subroutine dense_polar(A, U, args, info)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: U
+    type(msp_args), intent(in) :: args
+    type(msp_info), intent(in) :: info
+    type(msp_matrix) :: ah, ata, isq
+    real(dp) :: threshold
+
+    call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
+    call msp_transpose(A, ah, conjugate=.true.)
+    call msp_multiply(ah, A, ata, threshold=threshold)
+    call dense_function_impl(ata, isq, inverse_root_of, args, info, "positive")
+    call msp_multiply(A, isq, U, threshold=threshold)
+    call ah%free()
+    call ata%free()
+    call isq%free()
+  end subroutine dense_polar
+
+  real(dp) function inverse_root_of(x)
+    real(dp), intent(in) :: x
+
+    inverse_root_of = 1 / sqrt(x)
+  end function inverse_root_of
 
   !> -1, 0 or 1 by the sign of x.
   real(dp) function sign_of(x)

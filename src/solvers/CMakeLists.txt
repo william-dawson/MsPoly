@@ -22,15 +22,10 @@ msp_target_flags(mspoly_solvers)
 set_target_properties(mspoly_solvers PROPERTIES
   Fortran_MODULE_DIRECTORY ${MSP_MODULE_DIR})
 target_link_libraries(mspoly_solvers PUBLIC MsPoly::matrix)
+target_link_libraries(mspoly_solvers PRIVATE ${MSPOLY_SCALAPACK_LIBRARIES})
 if(MSPOLY_GPU)
-  target_sources(mspoly_solvers PRIVATE msp_pivot_gpu.cu)
+  target_sources(mspoly_solvers PRIVATE msp_pivot_gpu.cu msp_cusolvermp.cu)
   target_link_libraries(mspoly_solvers PRIVATE CUDA::cublas)
-endif()
-if(MSPOLY_SCALAPACK)
-  target_link_libraries(mspoly_solvers PRIVATE ${MSPOLY_SCALAPACK_LIBRARIES})
-endif()
-if(MSPOLY_CUSOLVERMP)
-  target_sources(mspoly_solvers PRIVATE msp_cusolvermp.cu)
   target_include_directories(mspoly_solvers PRIVATE ${CUSOLVERMP_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR})
   target_link_libraries(mspoly_solvers PRIVATE ${CUSOLVERMP_LIBRARY}

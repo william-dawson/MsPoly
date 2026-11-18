@@ -92,8 +92,8 @@ description: Language level, naming, comments, error handling and file layout fo
   They return 0 on success; call them through `check(code, what)`.
 - When the output size is unknown, use a count pass, allocate, then a fill
   pass.
-- Exchange device data with CUDA-aware MPI. NCCL is not used until
-  measurements show it is faster.
+- Exchange device data with CUDA-aware MPI. NCCL is used only by the
+  cuSOLVERMP dense eigensolver, which needs it.
 - Programs call `msp_select_gpu()` before `MPI_Init`. UCX sets up its GPU
   transports at `MPI_Init` only if a CUDA context exists; without one,
   sends from device memory between nodes fail ("cannot find remote

@@ -5,6 +5,7 @@ module msp_polynomial_mod
   use msp_error_mod, only: msp_raise
   use msp_dict_mod, only: msp_dict, msp_args, msp_info, copy
   use msp_matrix_mod
+  use msp_eigen_mod, only: dense_function_impl
   implicit none
   private
 
@@ -19,7 +20,9 @@ contains
   !> (default) x^k, "chebyshev" T_k or "hermite" H_k, the physicists'
   !> Hermite polynomials), method ("horner" (default) or
   !> "paterson_stockmeyer" for monomials; "recurrence" (default) or
-  !> "factorized" for Chebyshev), threshold (scoped, default 0).
+  !> "factorized" for Chebyshev; "dense" for any basis evaluates the
+  !> polynomial at the eigenvalues of a Hermitian A, with args and info as
+  !> for dense_function_impl), threshold (scoped, default 0).
   !> info: degree.
   subroutine msp_polynomial(A, B, args, info, context)
     type(msp_matrix), intent(in) :: A
@@ -50,6 +53,17 @@ contains
     call args%get("coefficients", c)
     call args%get("basis", basis, default="monomial")
     call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
+    if (args%has("method")) then
+       call args%get("method", method)
+       if (method == "dense") then
+          if (all(basis /= [character(9) :: "monomial", "chebyshev", &
+               & "hermite"])) call msp_raise( &
+               & "msp_polynomial: unknown basis '" // basis // "'")
+          call dense_function_impl(A, B, evaluate, args, info)
+          call info%set("degree", size(c) - 1)
+          return
+       end if
+    end if
     select case (basis)
     case ("monomial")
        call args%get("method", method, default="horner")
@@ -69,6 +83,38 @@ contains
     call info%set("degree", size(c) - 1)
 
   contains
+
+    !> The polynomial at the scalar x, by Horner's rule or the three term
+    !> recurrence of the basis.
+    real(dp) function evaluate(x)
+      real(dp), intent(in) :: x
+      real(dp) :: previous, current, next
+      integer :: k
+
+      select case (basis)
+      case ("monomial")
+         evaluate = c(size(c))
+         do k = size(c) - 1, 1, -1
+            evaluate = evaluate * x + c(k)
+         end do
+      case default
+         previous = 1
+         current = x
+         if (basis == "hermite") current = 2 * x
+         evaluate = c(1) * previous
+         if (size(c) > 1) evaluate = evaluate + c(2) * current
+         do k = 2, size(c) - 1
+            if (basis == "hermite") then
+               next = 2 * x * current - 2 * (k - 1) * previous
+            else
+               next = 2 * x * current - previous
+            end if
+            evaluate = evaluate + c(k + 1) * next
+            previous = current
+            current = next
+         end do
+      end select
+    end function evaluate
 
     subroutine check_method(known)
       character(*), dimension(:), intent(in) :: known

@@ -7,6 +7,7 @@ module msp_density_mod
   use msp_matrix_mod
   use msp_bounds_mod, only: bounds_impl
   use msp_sqrt_mod, only: sqrt_impl
+  use msp_fermi_mod, only: fermi_impl
   implicit none
   private
 
@@ -25,19 +26,26 @@ contains
   !> matrix S, these are the generalized eigenvectors of H C = S C E, and
   !> K S is the projector.
   !>
+  !> With method "dense", the projector comes from the eigendecomposition
+  !> of H instead (the zero temperature case of msp_fermi: args threshold
+  !> and eigen, and with an overlap inverse_sqrt, as for fermi_impl). A
+  !> trace that is not an integer fills the next state fractionally, and no
+  !> sample is kept.
+  !>
   !> args: trace (required), method ("trs2" (default), "trs4", "pm",
-  !> "hpcp" or "scale_and_fold", which also needs homo and lumo, the
-  !> highest occupied and lowest unoccupied eigenvalues), threshold (scoped,
-  !> default 0), tolerance (scoped, default 1e-6), max_iterations (default
-  !> 1000). K has the precision of H: with H in single precision, every
-  !> iterate is stored in single precision.
+  !> "hpcp", "scale_and_fold", which also needs homo and lumo, the
+  !> highest occupied and lowest unoccupied eigenvalues, or "dense"),
+  !> threshold (scoped, default 0), tolerance (scoped, default 1e-6),
+  !> max_iterations (default 1000). K has the precision of H: with H in
+  !> single precision, every iterate is stored in single precision.
   !> Optional sample keeps the last iterate with |X-X^2|_F above
   !> sampling_tolerance (default 1e-4), in the orthogonal basis when an
   !> overlap is given. Its iteration and error are reported under sample.
   !> info: energy = tr(K H), chemical_potential, iterations, converged,
   !> stop ("tolerance", "stagnation" or "max_iterations"), energy_history,
   !> idempotency_history, bounds, and with an overlap inverse_sqrt (args and
-  !> info of the inverse square root of S; see sqrt_impl).
+  !> info of the inverse square root of S; see sqrt_impl). With method
+  !> "dense": energy, chemical_potential, converged, eigen.
   subroutine msp_density(H, K, args, info, context, overlap, sample)
     type(msp_matrix), intent(in) :: H
     type(msp_matrix), intent(inout) :: K
@@ -107,6 +115,12 @@ contains
        call args%get("method", method, default=method_default)
     else
        call args%get("method", method, default="trs2")
+    end if
+    if (method == "dense") then
+       if (present(sample)) call sample%free()
+       call fermi_impl(H, K, args, info, overlap)
+       call info%set("converged", .true.)
+       return
     end if
     call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
     call args%get("tolerance", tolerance, default=1.0e-6_dp, scoped=.true.)

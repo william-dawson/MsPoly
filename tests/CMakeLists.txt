@@ -98,13 +98,11 @@ foreach(spec "backend;backend 'magma' is not built in"
              "temperature;inverse_temperature must be positive")
   list(GET spec 0 mode)
   list(GET spec 1 expected)
-  if(mode STREQUAL "backend" OR MSPOLY_SCALAPACK)
-    add_test(NAME solvers.test_eigen.${mode}
-      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${flags}
-              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:test_eigen> ${mode})
-    set_tests_properties(solvers.test_eigen.${mode} PROPERTIES
-      LABELS solvers PASS_REGULAR_EXPRESSION "${expected}")
-  endif()
+  add_test(NAME solvers.test_eigen.${mode}
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${flags}
+            ${MPIEXEC_PREFLAGS} $<TARGET_FILE:test_eigen> ${mode})
+  set_tests_properties(solvers.test_eigen.${mode} PROPERTIES
+    LABELS solvers PASS_REGULAR_EXPRESSION "${expected}")
 endforeach()
 
 # Expected stops: (mode, ranks, message the run must print).

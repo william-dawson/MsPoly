@@ -9,7 +9,7 @@ module msp_inverse_mod
   use msp_sqrt_mod, only: sqrt_impl
   use msp_polynomial_mod, only: identity_like
   use msp_convergence_mod, only: msp_monitor
-  use msp_eigen_mod, only: dense_function_impl
+  use msp_eigen_mod, only: dense_function_impl, eigen_impl, eigen_compose
   implicit none
   private
 
@@ -45,8 +45,15 @@ contains
     type(msp_dict), intent(in) :: args
     type(msp_dict), intent(inout), target :: info
     type(msp_dict), intent(in), target, optional :: context
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
 
-    call msp_inverse(A, X, args, info, context)
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call inverse_impl(A, a_args, r, X, pseudo=.true.)
+    call a_args%finish(r)
   end subroutine msp_pseudo_inverse
 
   !> X becomes A^(1/p), for a Hermitian positive definite A and the integer
@@ -110,16 +117,20 @@ contains
   !>
   !> With method "dense", the inverse of a Hermitian A comes from its
   !> eigendecomposition instead (args and info as for dense_function_impl).
+  !> For the pseudo-inverse, eigenvalues of magnitude at most cutoff (default
+  !> n epsilon) times the largest are taken to be zero, and info reports the
+  !> rank.
   !>
   !> args: method ("newton_schulz" (default) or "dense"), threshold (scoped,
   !> default 0), tolerance (scoped, default 1e-10), max_iterations (default
-  !> 100).
-  !> info: iterations, converged, stop, residual_history.
-  subroutine inverse_impl(A, args, info, X)
+  !> 100), cutoff (dense pseudo-inverse).
+  !> info: iterations, converged, stop, residual_history; rank.
+  subroutine inverse_impl(A, args, info, X, pseudo)
     type(msp_matrix), intent(in) :: A
     type(msp_args), intent(in) :: args
     type(msp_info), intent(in) :: info
     type(msp_matrix), intent(inout) :: X
+    logical, intent(in), optional :: pseudo
     type(msp_matrix) :: xa, next, id
     type(msp_monitor) :: mon
     real(dp), dimension(:), allocatable :: residual
@@ -130,6 +141,12 @@ contains
     call args%get("method", method, default="newton_schulz")
     select case (method)
     case ("dense")
+       if (present(pseudo)) then
+          if (pseudo) then
+             call dense_pseudo_inverse(A, X, args, info)
+             return
+          end if
+       end if
        call dense_function_impl(A, X, reciprocal, args, info, "nonzero")
        return
     case ("newton_schulz")
@@ -182,8 +199,12 @@ contains
   !>
   !> It stops when |M - I|_F is at most the tolerance or no longer falls.
   !>
-  !> args: threshold (scoped, default 0), tolerance (scoped, default 1e-10),
-  !> max_iterations (default 100), bounds (args of the bounds solver:
+  !> With method "dense", every order comes from the eigendecomposition of
+  !> the Hermitian A instead (args and info as for dense_function_impl).
+  !>
+  !> args: method ("newton_schulz" (default) or "dense"), threshold (scoped,
+  !> default 0), tolerance (scoped, default 1e-10), max_iterations (default
+  !> 100), bounds (args of the bounds solver:
   !> method "gershgorin" (default) or "power"; power's estimate is safe
   !> here because the final rescaling corrects the scaling). The reduction
   !> square roots take their args from the same dictionary; their reports
@@ -205,8 +226,16 @@ contains
     real(dp), dimension(:), allocatable :: residual
     real(dp) :: threshold, tolerance, emin, emax
     integer :: max_iterations, step, k, power, reductions
-    character(:), allocatable :: reason
+    character(:), allocatable :: reason, method
 
+    call args%get("method", method, default="newton_schulz")
+    if (method == "dense") then
+       call dense_function_impl(A, X, root_of, args, info, &
+            & trim(merge("positive   ", "nonnegative", inverse)))
+       return
+    else if (method /= "newton_schulz") then
+       call msp_raise("msp_root: unknown method '" // method // "'")
+    end if
     if (p == 1 .and. .not. inverse) then
        call copy(X, A)
        return
@@ -288,7 +317,44 @@ contains
     call id%free()
     call work%free()
     call base%free()
+
+  contains
+
+    !> x^(1/p), or x^(-1/p) with inverse; eigenvalues that rounding left
+    !> just below zero count as zero.
+    real(dp) function root_of(x)
+      real(dp), intent(in) :: x
+
+      root_of = max(x, 0.0_dp)**(merge(-1.0_dp, 1.0_dp, inverse) / p)
+    end function root_of
   end subroutine root_impl
+
+  !> X = A^+ for a Hermitian A, from its eigendecomposition. Collective.
+  subroutine dense_pseudo_inverse(A, X, args, info)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: X
+    type(msp_args), intent(in) :: args
+    type(msp_info), intent(in) :: info
+    type(msp_matrix) :: v
+    real(dp), dimension(:), allocatable :: values, weights
+    real(dp) :: cutoff, threshold, limit
+    integer :: q
+
+    call msp_cite("higham2008functions", info)
+    call args%get("cutoff", cutoff, default=A%n * epsilon(1.0_dp))
+    call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
+    call eigen_impl(A, values, args, info, vectors=v)
+    limit = cutoff * maxval(abs(values))
+    allocate(weights(size(values)))
+    do q = 1, size(values)
+       weights(q) = 0
+       if (abs(values(q)) > limit) weights(q) = 1 / values(q)
+    end do
+    call eigen_compose(v, weights, X, threshold)
+    call info%set("rank", count(weights /= 0))
+    call v%free()
+  end subroutine dense_pseudo_inverse
+
   real(dp) function reciprocal(x)
     real(dp), intent(in) :: x
 
