@@ -24,7 +24,9 @@ if(MSPOLY_GPU)
     string(REGEX REPLACE "^lib" "" name ${name})
     string(APPEND MSP_PC_LIBS " -L${dir} -l${name}")
   endforeach()
-  string(APPEND MSP_PC_LIBS " -lcublas -lcudart -lcuda -lstdc++")
+  # The CUDA libraries, and the stub of the driver library to link against.
+  string(APPEND MSP_PC_LIBS " -L${CUDAToolkit_LIBRARY_DIR}"
+    " -L${CUDAToolkit_LIBRARY_DIR}/stubs -lcublas -lcudart -lcuda -lstdc++")
 endif()
 
 configure_file(${PROJECT_SOURCE_DIR}/cmake/mspoly.pc.in
