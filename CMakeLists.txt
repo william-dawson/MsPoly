@@ -7,6 +7,11 @@ option(MSPOLY_BUILD_BENCH "Build the benchmarks" OFF)
 set(MSPOLY_SCALAPACK_LIBRARIES "scalapack" CACHE STRING
   "Libraries for ScaLAPACK, with BLACS, LAPACK and BLAS if separate")
 
+# The libraries are static; they can go into shared libraries.
+if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 include(MsPolyCompilers)
 include(MsPolyFypp)
@@ -36,6 +41,7 @@ set(MSPOLY_MPIEXEC_FLAGS "" CACHE STRING
 set(MSP_MODULE_DIR ${PROJECT_BINARY_DIR}/include)
 
 add_subdirectory(src)
+include(MsPolyInstall)
 if(MSPOLY_BUILD_BENCH)
   add_subdirectory(bench)
 endif()

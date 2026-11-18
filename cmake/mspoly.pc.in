@@ -1,0 +1,9 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: mspoly
+Description: Distributed sparse matrix functions of real and complex matrices
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lmspoly_solvers -lmspoly_matrix -lmspoly_utils @MSP_PC_LIBS@
+Cflags: -I${includedir}/mspoly
