@@ -1,0 +1,237 @@
+!> Filter/Lanczos gap edges with known spectra, automatic sampling,
+!> degeneracy, imperfect densities, and explicit non-convergence.
+program test_gap
+  use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
+  use msp_kinds_mod, only: dp
+  use msp_dict_mod, only: msp_dict
+  use msp_grid_mod, only: msp_grid
+  use msp_matrix_mod
+  use msp_gap_mod, only: msp_estimate_gap
+  use msp_density_mod, only: msp_density
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_allocations
+#:endif
+  use spectral_mod, only: spectrum, distribute, deviation
+  use testing_mod, only: check, finish
+  implicit none
+
+  type(msp_grid), target :: grid
+  type(msp_matrix) :: h, d, hv, lv, work, adjoint, density, sample
+  type(msp_dict) :: args, info, purification, report
+  integer, parameter :: n = 13
+  real(dp), parameter :: energies(n) = [-3.0_dp, -2.0_dp, -1.0_dp, &
+       & -0.5_dp, -0.2_dp, 0.3_dp, 0.6_dp, 1.0_dp, 1.5_dp, 2.0_dp, &
+       & 3.0_dp, 4.0_dp, 5.0_dp]
+  real(dp), parameter :: occupations(n) = [1-1.0e-8_dp, 1-1.0e-6_dp, &
+       & 0.9999_dp, 0.99_dp, 0.9_dp, 0.1_dp, 0.01_dp, 1.0e-4_dp, &
+       & 1.0e-6_dp, 1.0e-8_dp, 0.0_dp, 0.0_dp, 0.0_dp]
+  real(dp) :: weights(n), tau, first, second
+  complex(dp) :: small(2, 2)
+  real(dp) :: seed(2), v(2)
+  logical :: device, cplx
+  character(len=32) :: mode
+  integer :: kind
+
+  call get_command_argument(1, mode)
+  device = mode == "device"
+  call msp_select_gpu()
+  call MPI_Init()
+  call grid%init(MPI_COMM_WORLD)
+  if (mode /= "" .and. mode /= "device") call stops()
+  do kind = 1, 2
+     cplx = kind == 2
+     call distribute(h, spectrum(energies, cplx, 1.3_dp, 0.7_dp), grid, &
+          & cplx, device)
+     call distribute(d, spectrum(occupations, cplx, 1.3_dp, 0.7_dp), grid, &
+          & cplx, device)
+     call args%clear()
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d, homo_vector=hv, &
+          & lumo_vector=lv)
+     call check(info%get_logical("converged") .and. &
+          & abs(info%get_real("homo") + 0.2_dp) < 1.0e-9_dp .and. &
+          & abs(info%get_real("lumo") - 0.3_dp) < 1.0e-9_dp, &
+          & "supplied quasi-density: gap edges")
+     call check(info%get_logical("citations.truflandier2026gap") .and. &
+          & info%get_logical("citations.lanczos1950iteration") .and. &
+          & .not. info%has("citations.truflandier2016communication"), &
+          & "supplied density cites filters and Lanczos only")
+     weights = 0
+     weights(5) = 1
+     call msp_transpose(hv, adjoint, conjugate=.true.)
+     call msp_multiply(hv, adjoint, work)
+     call check(deviation(work, spectrum(weights, cplx, 1.3_dp, 0.7_dp)) &
+          & < 1.0e-7_dp .and. (hv%on_device() .eqv. device), &
+          & "HOMO projector and placement")
+     weights(5) = 0
+     weights(6) = 1
+     call msp_transpose(lv, adjoint, conjugate=.true.)
+     call msp_multiply(lv, adjoint, work)
+     call check(deviation(work, spectrum(weights, cplx, 1.3_dp, 0.7_dp)) &
+          & < 1.0e-7_dp, "LUMO projector")
+
+     call purification%clear()
+     call purification%set("trace", 5.0_dp)
+     call purification%set("method", "hpcp")
+     call purification%set("tolerance", 1.0e-12_dp)
+     call msp_density(h, density, purification, report, sample=sample)
+     call msp_multiply(sample, sample, work)
+     call msp_add(work, sample, alpha=-1.0_dp)
+     tau = msp_norm(work)
+     call check(tau > 1.0e-4_dp .and. &
+          & abs(tau - report%get_real("sample.idempotency")) < &
+          & 1.0e-12_dp, "sample retained before idempotency")
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=sample)
+     first = info%get_real("gap")
+     call check(info%get_logical("converged") .and. &
+          & abs(first - 0.5_dp) < 1.0e-8_dp, "sampled density gap")
+     call args%set("density.trace", 5.0_dp)
+     call args%set("density.tolerance", 1.0e-12_dp)
+     call args%set("threshold", 1.0e-14_dp)
+     call info%clear()
+     call msp_estimate_gap(h, args, info)
+     second = info%get_real("gap")
+     call check(info%get_logical("converged") .and. &
+          & abs(second - first) < 1.0e-8_dp .and. &
+          & .not. info%has("unused_arguments"), &
+          & "automatic sampling and sparse threshold")
+     call check(info%get_logical("citations.truflandier2016communication") &
+          & .and. info%get_logical("citations.kruchinina2016parameterless"), &
+          & "nested purification citations reach the gap report")
+     call purification%set("method", "trs2")
+     call msp_density(h, density, purification, report, sample=sample)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=sample)
+     call check(.not. info%get_logical("converged"), &
+          & "asymmetric sample cannot certify both edges")
+
+     call args%clear()
+     call args%set("max_iterations", 1)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(.not. info%get_logical("converged") .and. &
+          & info%get_int("occupied.iterations") == 1, &
+          & "iteration limit reports non-convergence")
+     call args%clear()
+     call msp_to_single(d)
+     call args%set("tolerance", 1.0e-5_dp)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(info%get_logical("converged") .and. &
+          & abs(info%get_real("gap") - 0.5_dp) < 1.0e-5_dp, &
+          & "single-precision density widened for Lanczos")
+
+     call args%clear()
+     weights = 0
+     weights(1:5) = 1
+     call distribute(d, spectrum(weights, cplx, 1.3_dp, 0.7_dp), grid, &
+          & cplx, device)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(.not. info%get_logical("converged") .and. &
+          & ieee_is_nan(info%get_real("gap")), &
+          & "idempotent density has no usable filter signal")
+
+     call distribute(h, spectrum([-1.0_dp, -1.0_dp, 1.0_dp, 1.0_dp], &
+          & cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call distribute(d, spectrum([0.99_dp, 0.99_dp, 0.01_dp, 0.01_dp], &
+          & cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(info%get_logical("converged") .and. &
+          & abs(info%get_real("gap") - 2.0_dp) < 1.0e-10_dp, &
+          & "degenerate edge eigenspaces")
+     call distribute(h, spectrum([-0.200001_dp, -0.2_dp, 0.3_dp, &
+          & 0.300001_dp], cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call distribute(d, spectrum([0.900001_dp, 0.9_dp, 0.1_dp, &
+          & 0.099999_dp], cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(info%get_logical("converged") .and. &
+          & abs(info%get_real("gap") - 0.5_dp) < 1.0e-10_dp, &
+          & "nearly degenerate edges resolve without power iteration")
+
+     call distribute(h, spectrum([-1.0_dp, 0.5_dp, 2.0_dp], &
+          & cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call distribute(d, spectrum([0.99_dp, 0.01_dp, 0.0001_dp], &
+          & cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(info%get_logical("converged") .and. &
+          & abs(info%get_real("gap") - 1.5_dp) < 1.0e-10_dp, &
+          & "dimension smaller than grid")
+     call distribute(d, spectrum([0.9_dp, 0.9_dp, 0.9_dp], &
+          & cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, density=d)
+     call check(.not. info%get_logical("converged"), &
+          & "density with no unoccupied subspace is rejected")
+
+     call args%set("density.trace", 1.0_dp)
+     call args%set("density.sampling_tolerance", 100.0_dp)
+     call info%clear()
+     call msp_estimate_gap(h, args, info, homo_vector=hv, lumo_vector=lv)
+     call check(.not. info%get_logical("converged") .and. hv%n == 0 &
+          & .and. lv%n == 0, "no sample clears previous output vectors")
+  end do
+  !! A rank-one filter with a starting vector in its nullspace.
+  seed = sin([1.0_dp, 2.0_dp] * sqrt(2.0_dp) + 1) + &
+       & cos([1.0_dp, 2.0_dp] * sqrt(3.0_dp) - 1)
+  v = [seed(2), -seed(1)] / sqrt(sum(seed**2))
+  small = 0.9_dp * spread(v, 2, 2) * spread(v, 1, 2)
+  call distribute(d, small, grid, .false., device)
+  call distribute(h, spectrum([-1.0_dp, 1.0_dp], .false., 1.3_dp, &
+       & 0.7_dp), grid, .false., device)
+  call args%clear()
+  call info%clear()
+  call msp_estimate_gap(h, args, info, density=d)
+  call check(.not. info%get_logical("converged") .and. &
+       & info%get_string("occupied.stop") == "empty_start", &
+       & "nullspace start reports failure")
+  call args%set("seed", 2)
+  call info%clear()
+  call msp_estimate_gap(h, args, info, density=d)
+  call check(.not. info%get_logical("converged") .and. &
+       & info%get_string("occupied.stop") == "breakdown", &
+       & "noncommuting density cannot certify an H eigenpair")
+  call h%free()
+  call d%free()
+  call hv%free()
+  call lv%free()
+  call work%free()
+  call adjoint%free()
+  call density%free()
+  call sample%free()
+#:if defined('MSPOLY_GPU')
+  call check(msp_gpu_allocations() == 0, "all device allocations released")
+#:endif
+  call grid%free()
+  call finish("test_gap")
+  call MPI_Finalize()
+
+contains
+
+  subroutine stops()
+    call distribute(h, spectrum([-1.0_dp, 1.0_dp], .false., 1.3_dp, &
+         & 0.7_dp), grid, .false., .false.)
+    call args%set("density.trace", 1.0_dp)
+    select case (mode)
+    case ("limit")
+       call args%set("max_iterations", 0)
+    case ("tolerance")
+       call args%set("tolerance", 0.0_dp)
+    case ("trace")
+       call args%set("density.trace", 0.0_dp)
+    case ("sampling")
+       call args%set("density.sampling_tolerance", 0.0_dp)
+    case ("shape")
+       call d%init(grid, 3)
+       call info%clear()
+       call msp_estimate_gap(h, args, info, density=d)
+    end select
+    call info%clear()
+    call msp_estimate_gap(h, args, info)
+  end subroutine stops
+end program test_gap

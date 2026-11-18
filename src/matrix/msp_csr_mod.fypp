@@ -1,0 +1,639 @@
+#! (suffix, value type, MPI datatype, is complex, is single, arithmetic type,
+#!  value from arithmetic, arithmetic from value)
+#:set KINDS = [ &
+  ('r', 'real(dp)', 'MPI_DOUBLE_PRECISION', '.false.', '.false.', 'real(dp)', '%s', '%s'), &
+  ('c', 'complex(dp)', 'MPI_DOUBLE_COMPLEX', '.true.', '.false.', 'complex(dp)', '%s', '%s'), &
+  ('rs', 'real(sp)', 'MPI_REAL', '.false.', '.true.', 'real(dp)', 'real(%s, sp)', 'real(%s, dp)'), &
+  ('cs', 'complex(sp)', 'MPI_COMPLEX', '.true.', '.true.', 'complex(dp)', 'cmplx(%s, kind=sp)', 'cmplx(%s, kind=dp)')]
+!> Compressed sparse row storage on the host, for real and complex values in
+!> double or single precision.
+!>
+!> Columns within a row are sorted and unique: that keeps addition and dot
+!> products single merges, and lets pieces be concatenated without sorting.
+!> Offsets are default integers: a piece holds fewer than 2**31 entries.
+!> Arithmetic is in double precision; single precision values are rounded
+!> once when stored.
+module msp_csr_mod
+  use mpi_f08, only: MPI_Comm, MPI_INTEGER, MPI_DOUBLE_PRECISION, &
+       & MPI_DOUBLE_COMPLEX, MPI_REAL, MPI_COMPLEX, MPI_Comm_size, &
+       & MPI_Allgather, MPI_Allgatherv
+  !$ use omp_lib, only: omp_get_max_threads, omp_get_thread_num
+  use msp_kinds_mod, only: dp, sp, i64
+  use msp_error_mod, only: msp_raise
+  use msp_storage_mod, only: msp_storage, msp_free
+  implicit none
+  private
+
+  public :: msp_csr_r, msp_csr_c, msp_csr_rs, msp_csr_cs
+
+#:for k, ty, mpit, cplx, single, acc, narrow, wide in KINDS
+  !> Row i is row_ptr(i) to row_ptr(i+1) - 1 of col and val.
+  type, extends(msp_storage) :: msp_csr_${k}$
+     integer, dimension(:), allocatable :: row_ptr
+     integer, dimension(:), allocatable :: col
+     ${ty}$, dimension(:), allocatable :: val
+   contains
+  #:if single == '.false.'
+     procedure :: build => build_${k}$
+     procedure :: entries => entries_${k}$
+  #:endif
+     procedure :: release => release_${k}$
+     procedure :: is_complex => is_complex_${k}$
+     procedure :: is_single => is_single_${k}$
+     procedure :: nnz => nnz_${k}$
+     procedure :: copy_to => copy_to_${k}$
+     procedure :: convert_to => convert_to_${k}$
+     procedure :: scale => scale_${k}$
+     procedure :: add => add_${k}$
+     procedure :: dot => dot_${k}$
+     procedure :: trace => trace_${k}$
+     procedure :: norm2 => norm2_${k}$
+     procedure :: gather_rows => gather_rows_${k}$
+     procedure :: gather_cols => gather_cols_${k}$
+     procedure :: multiply => multiply_${k}$
+  end type msp_csr_${k}$
+
+  !> One thread's rows of a product.
+  type :: chunk_${k}$
+     integer, dimension(:), allocatable :: counts
+     integer, dimension(:), allocatable :: col
+     ${ty}$, dimension(:), allocatable :: val
+     integer :: n = 0
+  end type chunk_${k}$
+
+#:endfor
+contains
+
+#:for k, ty, mpit, cplx, single, acc, narrow, wide in KINDS
+  #:if single == '.false.'
+  !> Build from local triplets (1-based local indices). Duplicates are summed.
+  subroutine build_${k}$(this, rows, cols, i, j, v)
+    class(msp_csr_${k}$), intent(inout) :: this
+    integer, intent(in) :: rows, cols
+    integer, dimension(:), intent(in) :: i, j
+    ${ty}$, dimension(:), intent(in) :: v
+    integer, dimension(:), allocatable :: next
+    integer :: p, w, first
+    integer :: k, r
+
+    this%rows = rows
+    this%cols = cols
+    if (allocated(this%row_ptr)) deallocate(this%row_ptr)
+    allocate(this%row_ptr(rows + 1))
+    this%row_ptr = 0
+    do k = 1, size(i)
+       this%row_ptr(i(k) + 1) = this%row_ptr(i(k) + 1) + 1
+    end do
+    this%row_ptr(1) = 1
+    do r = 1, rows
+       this%row_ptr(r + 1) = this%row_ptr(r + 1) + this%row_ptr(r)
+    end do
+    if (allocated(this%col)) deallocate(this%col, this%val)
+    allocate(this%col(size(i)), this%val(size(i)))
+    next = this%row_ptr(1:rows)
+    do k = 1, size(i)
+       this%col(next(i(k))) = j(k)
+       this%val(next(i(k))) = v(k)
+       next(i(k)) = next(i(k)) + 1
+    end do
+    !! Sort each row by column, then merge duplicates in place.
+    w = 0
+    do r = 1, rows
+       first = this%row_ptr(r)
+       call sort_${k}$(this%col(first:this%row_ptr(r + 1) - 1), &
+            & this%val(first:this%row_ptr(r + 1) - 1))
+       this%row_ptr(r) = w + 1
+       do p = first, this%row_ptr(r + 1) - 1
+          if (w >= this%row_ptr(r)) then
+             if (this%col(w) == this%col(p)) then
+                this%val(w) = this%val(w) + this%val(p)
+                cycle
+             end if
+          end if
+          w = w + 1
+          this%col(w) = this%col(p)
+          this%val(w) = this%val(p)
+       end do
+    end do
+    this%row_ptr(rows + 1) = w + 1
+    block
+      integer, dimension(:), allocatable :: col
+      ${ty}$, dimension(:), allocatable :: val
+      col = this%col(1:w)
+      val = this%val(1:w)
+      call move_alloc(col, this%col)
+      call move_alloc(val, this%val)
+    end block
+  end subroutine build_${k}$
+
+  !> Local triplets (1-based local indices).
+  subroutine entries_${k}$(this, i, j, v)
+    class(msp_csr_${k}$), intent(in) :: this
+    integer, dimension(:), allocatable, intent(out) :: i, j
+    ${ty}$, dimension(:), allocatable, intent(out) :: v
+    integer :: r
+
+    allocate(i(size(this%col)))
+    do r = 1, this%rows
+       i(this%row_ptr(r):this%row_ptr(r + 1) - 1) = r
+    end do
+    j = this%col
+    v = this%val
+  end subroutine entries_${k}$
+
+  !> Shell sort of col, permuting val alongside.
+  subroutine sort_${k}$(col, val)
+    integer, dimension(:), intent(inout) :: col
+    ${ty}$, dimension(:), intent(inout) :: val
+    integer :: gap, i, j, c
+    ${ty}$ :: v
+
+    gap = size(col) / 2
+    do while (gap > 0)
+       do i = gap + 1, size(col)
+          c = col(i)
+          v = val(i)
+          j = i
+          do while (j > gap)
+             if (col(j - gap) <= c) exit
+             col(j) = col(j - gap)
+             val(j) = val(j - gap)
+             j = j - gap
+          end do
+          col(j) = c
+          val(j) = v
+       end do
+       gap = gap / 2
+    end do
+  end subroutine sort_${k}$
+  #:endif
+
+  !> Host pieces hold only Fortran-managed memory.
+  subroutine release_${k}$(this)
+    class(msp_csr_${k}$), intent(inout) :: this
+
+    if (this%rows < 0) continue
+  end subroutine release_${k}$
+
+  logical function is_complex_${k}$(this) result(c)
+    class(msp_csr_${k}$), intent(in) :: this
+
+    if (this%rows < 0) continue
+    c = ${cplx}$
+  end function is_complex_${k}$
+
+  logical function is_single_${k}$(this) result(s)
+    class(msp_csr_${k}$), intent(in) :: this
+
+    if (this%rows < 0) continue
+    s = ${single}$
+  end function is_single_${k}$
+
+  integer(i64) function nnz_${k}$(this) result(n)
+    class(msp_csr_${k}$), intent(in) :: this
+
+    n = size(this%col, kind=i64)
+  end function nnz_${k}$
+
+  subroutine copy_to_${k}$(this, dst)
+    class(msp_csr_${k}$), intent(in) :: this
+    class(msp_storage), allocatable, intent(inout) :: dst
+
+    call msp_free(dst)
+    allocate(msp_csr_${k}$ :: dst)
+    select type (dst)
+    type is (msp_csr_${k}$)
+       dst%rows = this%rows
+       dst%cols = this%cols
+       dst%row_ptr = this%row_ptr
+       dst%col = this%col
+       dst%val = this%val
+    end select
+  end subroutine copy_to_${k}$
+
+  subroutine convert_to_${k}$(this, dst, cplx, single)
+    class(msp_csr_${k}$), intent(in) :: this
+    class(msp_storage), allocatable, intent(inout) :: dst
+    logical, intent(in) :: cplx, single
+
+    call msp_free(dst)
+  #:if cplx == '.true.'
+    if (.not. cplx) call msp_raise("msp_csr: complex values cannot become real")
+  #:endif
+  #:for t, tty, tmpit, tcplx, tsingle, tacc, tnarrow, twide in KINDS
+    #:if tcplx == '.true.' or cplx == '.false.'
+    if ((cplx .eqv. ${tcplx}$) .and. (single .eqv. ${tsingle}$)) &
+         & allocate(msp_csr_${t}$ :: dst)
+    #:endif
+  #:endfor
+    select type (dst)
+  #:for t, tty, tmpit, tcplx, tsingle, tacc, tnarrow, twide in KINDS
+    #:if tcplx == '.true.' or cplx == '.false.'
+    type is (msp_csr_${t}$)
+       dst%rows = this%rows
+       dst%cols = this%cols
+       dst%row_ptr = this%row_ptr
+       dst%col = this%col
+      #:if tcplx == '.true.'
+       dst%val = cmplx(this%val, kind=${tty[-3:-1]}$)
+      #:else
+       dst%val = real(this%val, ${tty[-3:-1]}$)
+      #:endif
+    #:endif
+  #:endfor
+    end select
+  end subroutine convert_to_${k}$
+
+  subroutine scale_${k}$(this, alpha)
+    class(msp_csr_${k}$), intent(inout) :: this
+    complex(dp), intent(in) :: alpha
+
+  #:if cplx == '.false.'
+    this%val = ${narrow % ('real(alpha, dp) * ' + (wide % 'this%val'))}$
+  #:else
+    this%val = ${narrow % ('alpha * ' + (wide % 'this%val'))}$
+  #:endif
+  end subroutine scale_${k}$
+
+  subroutine add_${k}$(this, x, alpha, threshold)
+    class(msp_csr_${k}$), intent(inout) :: this
+    class(msp_storage), intent(in) :: x
+    complex(dp), intent(in) :: alpha
+    real(dp), intent(in) :: threshold
+    integer, dimension(:), allocatable :: row_ptr
+    integer, dimension(:), allocatable :: col
+    ${ty}$, dimension(:), allocatable :: val
+    ${acc}$ :: a, v
+    integer :: p, q, w
+    integer :: r, c
+
+    select type (x)
+    type is (msp_csr_${k}$)
+  #:if cplx == '.false.'
+       a = real(alpha, dp)
+  #:else
+       a = alpha
+  #:endif
+       allocate(row_ptr(this%rows + 1), col(size(this%col) + size(x%col)), &
+            & val(size(this%col) + size(x%col)))
+       w = 0
+       row_ptr(1) = 1
+       do r = 1, this%rows
+          p = this%row_ptr(r)
+          q = x%row_ptr(r)
+          do while (p < this%row_ptr(r + 1) .or. q < x%row_ptr(r + 1))
+             if (p >= this%row_ptr(r + 1)) then
+                c = x%col(q)
+                v = a * ${wide % 'x%val(q)'}$
+                q = q + 1
+             else if (q >= x%row_ptr(r + 1)) then
+                c = this%col(p)
+                v = ${wide % 'this%val(p)'}$
+                p = p + 1
+             else if (this%col(p) < x%col(q)) then
+                c = this%col(p)
+                v = ${wide % 'this%val(p)'}$
+                p = p + 1
+             else if (x%col(q) < this%col(p)) then
+                c = x%col(q)
+                v = a * ${wide % 'x%val(q)'}$
+                q = q + 1
+             else
+                c = this%col(p)
+                v = ${wide % 'this%val(p)'}$ + a * ${wide % 'x%val(q)'}$
+                p = p + 1
+                q = q + 1
+             end if
+             if (v /= 0 .and. abs(v) >= threshold) then
+                w = w + 1
+                col(w) = c
+                val(w) = ${narrow % 'v'}$
+             end if
+          end do
+          row_ptr(r + 1) = w + 1
+       end do
+       call move_alloc(row_ptr, this%row_ptr)
+       this%col = col(1:w)
+       this%val = val(1:w)
+    class default
+       call msp_raise("msp_csr: operands of different storage types")
+    end select
+  end subroutine add_${k}$
+
+  complex(dp) function dot_${k}$(this, x) result(d)
+    class(msp_csr_${k}$), intent(in) :: this
+    class(msp_storage), intent(in) :: x
+    integer :: p, q
+    integer :: r
+
+    d = 0
+    select type (x)
+    type is (msp_csr_${k}$)
+       do r = 1, this%rows
+          p = this%row_ptr(r)
+          q = x%row_ptr(r)
+          do while (p < this%row_ptr(r + 1) .and. q < x%row_ptr(r + 1))
+             if (this%col(p) < x%col(q)) then
+                p = p + 1
+             else if (x%col(q) < this%col(p)) then
+                q = q + 1
+             else
+  #:if cplx == '.false.'
+                d = d + ${wide % 'this%val(p)'}$ * ${wide % 'x%val(q)'}$
+  #:else
+                d = d + conjg(${wide % 'this%val(p)'}$) * ${wide % 'x%val(q)'}$
+  #:endif
+                p = p + 1
+                q = q + 1
+             end if
+          end do
+       end do
+    class default
+       call msp_raise("msp_csr: operands of different storage types")
+    end select
+  end function dot_${k}$
+
+  complex(dp) function trace_${k}$(this, row0, col0) result(t)
+    class(msp_csr_${k}$), intent(in) :: this
+    integer, intent(in) :: row0, col0
+    integer :: p
+    integer :: r
+
+    t = 0
+    do r = 1, this%rows
+       do p = this%row_ptr(r), this%row_ptr(r + 1) - 1
+          if (col0 + this%col(p) == row0 + r) t = t + ${wide % 'this%val(p)'}$
+       end do
+    end do
+  end function trace_${k}$
+
+  real(dp) function norm2_${k}$(this) result(s)
+    class(msp_csr_${k}$), intent(in) :: this
+
+    s = sum(abs(${wide % 'this%val'}$)**2)
+  end function norm2_${k}$
+
+  subroutine gather_rows_${k}$(this, comm, band)
+    class(msp_csr_${k}$), intent(in) :: this
+    type(MPI_Comm), intent(in) :: comm
+    class(msp_storage), allocatable, intent(inout) :: band
+    integer, dimension(:), allocatable :: widths, counts, displs, rows_nnz, &
+         & all_rows_nnz, all_col
+    ${ty}$, dimension(:), allocatable :: all_val
+    integer, dimension(:), allocatable :: pos, offset
+    integer :: w
+    integer :: np, p, r, n
+
+    call MPI_Comm_size(comm, np)
+    allocate(widths(np), counts(np), all_rows_nnz(this%rows * np))
+    call MPI_Allgather(this%cols, 1, MPI_INTEGER, widths, 1, MPI_INTEGER, &
+         & comm)
+    call MPI_Allgather(local_count(this), 1, MPI_INTEGER, counts, 1, &
+         & MPI_INTEGER, comm)
+    rows_nnz = int(this%row_ptr(2:) - this%row_ptr(:this%rows))
+    call MPI_Allgather(rows_nnz, this%rows, MPI_INTEGER, all_rows_nnz, &
+         & this%rows, MPI_INTEGER, comm)
+    displs = [0, (sum(counts(1:p)), p = 1, np - 1)]
+    allocate(all_col(sum(counts)), all_val(sum(counts)))
+    call MPI_Allgatherv(this%col, local_count(this), MPI_INTEGER, all_col, &
+         & counts, displs, MPI_INTEGER, comm)
+    call MPI_Allgatherv(this%val, local_count(this), ${mpit}$, all_val, &
+         & counts, displs, ${mpit}$, comm)
+    offset = [0, (sum(widths(1:p)), p = 1, np - 1)]
+    pos = displs
+    call msp_free(band)
+    allocate(msp_csr_${k}$ :: band)
+    select type (band)
+    type is (msp_csr_${k}$)
+       band%rows = this%rows
+       band%cols = sum(widths)
+       allocate(band%row_ptr(this%rows + 1), band%col(sum(counts)), &
+            & band%val(sum(counts)))
+       w = 0
+       band%row_ptr(1) = 1
+       do r = 1, this%rows
+          do p = 1, np
+             n = all_rows_nnz((p - 1) * this%rows + r)
+             band%col(w + 1:w + n) = all_col(pos(p) + 1:pos(p) + n) + offset(p)
+             band%val(w + 1:w + n) = all_val(pos(p) + 1:pos(p) + n)
+             pos(p) = pos(p) + n
+             w = w + n
+          end do
+          band%row_ptr(r + 1) = w + 1
+       end do
+    end select
+  end subroutine gather_rows_${k}$
+
+  subroutine gather_cols_${k}$(this, comm, band)
+    class(msp_csr_${k}$), intent(in) :: this
+    type(MPI_Comm), intent(in) :: comm
+    class(msp_storage), allocatable, intent(inout) :: band
+    integer, dimension(:), allocatable :: heights, counts, displs, &
+         & row_displs, rows_nnz, all_rows_nnz
+    integer :: np, p, r
+
+    call MPI_Comm_size(comm, np)
+    allocate(heights(np), counts(np))
+    call MPI_Allgather(this%rows, 1, MPI_INTEGER, heights, 1, MPI_INTEGER, &
+         & comm)
+    call MPI_Allgather(local_count(this), 1, MPI_INTEGER, counts, 1, &
+         & MPI_INTEGER, comm)
+    displs = [0, (sum(counts(1:p)), p = 1, np - 1)]
+    row_displs = [0, (sum(heights(1:p)), p = 1, np - 1)]
+    rows_nnz = int(this%row_ptr(2:) - this%row_ptr(:this%rows))
+    allocate(all_rows_nnz(sum(heights)))
+    call MPI_Allgatherv(rows_nnz, this%rows, MPI_INTEGER, all_rows_nnz, &
+         & heights, row_displs, MPI_INTEGER, comm)
+    call msp_free(band)
+    allocate(msp_csr_${k}$ :: band)
+    select type (band)
+    type is (msp_csr_${k}$)
+       band%rows = sum(heights)
+       band%cols = this%cols
+       allocate(band%row_ptr(band%rows + 1), band%col(sum(counts)), &
+            & band%val(sum(counts)))
+       band%row_ptr(1) = 1
+       do r = 1, band%rows
+          band%row_ptr(r + 1) = band%row_ptr(r) + all_rows_nnz(r)
+       end do
+       call MPI_Allgatherv(this%col, local_count(this), MPI_INTEGER, &
+            & band%col, counts, displs, MPI_INTEGER, comm)
+       call MPI_Allgatherv(this%val, local_count(this), ${mpit}$, band%val, &
+            & counts, displs, ${mpit}$, comm)
+    end select
+  end subroutine gather_cols_${k}$
+
+  subroutine multiply_${k}$(this, a, b, alpha, beta, threshold)
+    class(msp_csr_${k}$), intent(inout) :: this
+    class(msp_storage), intent(in) :: a, b
+    complex(dp), intent(in) :: alpha, beta
+    real(dp), intent(in) :: threshold
+
+    select type (a)
+    type is (msp_csr_${k}$)
+       select type (b)
+       type is (msp_csr_${k}$)
+  #:if cplx == '.false.'
+          call product_${k}$(this, a, b, real(alpha, dp), real(beta, dp), &
+               & threshold)
+  #:else
+          call product_${k}$(this, a, b, alpha, beta, threshold)
+  #:endif
+       class default
+          call msp_raise("msp_csr: operands of different storage types")
+       end select
+    class default
+       call msp_raise("msp_csr: operands of different storage types")
+    end select
+  end subroutine multiply_${k}$
+
+  !> Row-by-row (Gustavson) product with a dense accumulator per thread.
+  !> Threads take contiguous row ranges and write private chunks, which are
+  !> concatenated in order, so the result needs no further sorting.
+  subroutine product_${k}$(c, a, b, alpha, beta, threshold)
+    class(msp_csr_${k}$), intent(inout) :: c
+    type(msp_csr_${k}$), intent(in) :: a, b
+    ${acc}$, intent(in) :: alpha, beta
+    real(dp), intent(in) :: threshold
+    type(chunk_${k}$), dimension(:), allocatable :: chunks
+    integer, dimension(:), allocatable :: row_ptr
+    integer, dimension(:), allocatable :: col
+    ${ty}$, dimension(:), allocatable :: val
+    logical :: keep_c
+    integer :: w
+    integer :: nt, t, r, first
+
+    keep_c = beta /= 0
+    nt = 1
+    !$ nt = omp_get_max_threads()
+    allocate(chunks(nt))
+    !$omp parallel default(shared) private(t)
+    t = 1
+    !$ t = omp_get_thread_num() + 1
+    call product_rows_${k}$(c, a, b, alpha, beta, threshold, keep_c, &
+         & (t - 1) * a%rows / nt + 1, t * a%rows / nt, chunks(t))
+    !$omp end parallel
+
+    allocate(row_ptr(a%rows + 1), col(sum(chunks%n)), val(sum(chunks%n)))
+    row_ptr(1) = 1
+    w = 0
+    do t = 1, nt
+       first = (t - 1) * a%rows / nt + 1
+       do r = 1, size(chunks(t)%counts)
+          row_ptr(first + r) = row_ptr(first + r - 1) + chunks(t)%counts(r)
+       end do
+       col(w + 1:w + chunks(t)%n) = chunks(t)%col(1:chunks(t)%n)
+       val(w + 1:w + chunks(t)%n) = chunks(t)%val(1:chunks(t)%n)
+       w = w + chunks(t)%n
+    end do
+    c%rows = a%rows
+    c%cols = b%cols
+    call move_alloc(row_ptr, c%row_ptr)
+    call move_alloc(col, c%col)
+    call move_alloc(val, c%val)
+  end subroutine product_${k}$
+
+  subroutine product_rows_${k}$(c, a, b, alpha, beta, threshold, keep_c, &
+       & first, last, chunk)
+    class(msp_csr_${k}$), intent(in) :: c
+    type(msp_csr_${k}$), intent(in) :: a, b
+    ${acc}$, intent(in) :: alpha, beta
+    real(dp), intent(in) :: threshold
+    logical, intent(in) :: keep_c
+    integer, intent(in) :: first, last
+    type(chunk_${k}$), intent(inout) :: chunk
+    ${acc}$, dimension(:), allocatable :: acc
+    integer, dimension(:), allocatable :: seen, list
+    ${acc}$ :: av
+    integer :: p, q
+    integer :: r, j, n, m
+
+    allocate(acc(b%cols), seen(b%cols), list(b%cols))
+    seen = 0
+    allocate(chunk%counts(max(last - first + 1, 0)), chunk%col(64), &
+         & chunk%val(64))
+    chunk%n = 0
+    do r = first, last
+       n = 0
+       if (keep_c) then
+          do q = c%row_ptr(r), c%row_ptr(r + 1) - 1
+             j = c%col(q)
+             seen(j) = r
+             acc(j) = beta * ${wide % 'c%val(q)'}$
+             n = n + 1
+             list(n) = j
+          end do
+       end if
+       do p = a%row_ptr(r), a%row_ptr(r + 1) - 1
+          av = alpha * ${wide % 'a%val(p)'}$
+          do q = b%row_ptr(a%col(p)), b%row_ptr(a%col(p) + 1) - 1
+             j = b%col(q)
+             if (seen(j) /= r) then
+                seen(j) = r
+                acc(j) = 0
+                n = n + 1
+                list(n) = j
+             end if
+             acc(j) = acc(j) + av * ${wide % 'b%val(q)'}$
+          end do
+       end do
+       call sort_int(list(1:n))
+       m = 0
+       call reserve_${k}$(chunk, chunk%n + n)
+       do q = 1, n
+          if (acc(list(q)) /= 0 .and. abs(acc(list(q))) >= threshold) then
+             m = m + 1
+             chunk%col(chunk%n + m) = list(q)
+             chunk%val(chunk%n + m) = ${narrow % 'acc(list(q))'}$
+          end if
+       end do
+       chunk%n = chunk%n + m
+       chunk%counts(r - first + 1) = m
+    end do
+  end subroutine product_rows_${k}$
+
+  subroutine reserve_${k}$(chunk, n)
+    type(chunk_${k}$), intent(inout) :: chunk
+    integer, intent(in) :: n
+    integer, dimension(:), allocatable :: col
+    ${ty}$, dimension(:), allocatable :: val
+
+    if (n <= size(chunk%col)) return
+    allocate(col(max(2 * size(chunk%col), n)), val(max(2 * &
+         & size(chunk%col), n)))
+    col(1:chunk%n) = chunk%col(1:chunk%n)
+    val(1:chunk%n) = chunk%val(1:chunk%n)
+    call move_alloc(col, chunk%col)
+    call move_alloc(val, chunk%val)
+  end subroutine reserve_${k}$
+
+
+#:endfor
+  !> Shell sort.
+  subroutine sort_int(x)
+    integer, dimension(:), intent(inout) :: x
+    integer :: gap, i, j, c
+
+    gap = size(x) / 2
+    do while (gap > 0)
+       do i = gap + 1, size(x)
+          c = x(i)
+          j = i
+          do while (j > gap)
+             if (x(j - gap) <= c) exit
+             x(j) = x(j - gap)
+             j = j - gap
+          end do
+          x(j) = c
+       end do
+       gap = gap / 2
+    end do
+  end subroutine sort_int
+
+  !> Number of local entries as an MPI count.
+  integer function local_count(s) result(n)
+    class(msp_storage), intent(in) :: s
+
+    n = int(s%nnz())
+  end function local_count
+end module msp_csr_mod

@@ -1,0 +1,478 @@
+!> Matrix functions on matrices U D U^H with a known spectrum D, against
+!> U f(D) U^H: polynomials, exponentials, logarithms, sines and cosines,
+!> inverses, roots, sign and polar decomposition, power-method bounds,
+!> conjugate gradients and Cholesky factorizations. Real
+!> and complex; run on 1, 2 and 4 ranks. With the argument "device", inputs
+!> are moved to the GPU. Other arguments name a call that must stop the
+!> program: basis, method, exp_method, bounds_method, log_roots, root,
+!> cholesky.
+program test_functions
+  use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD
+  use msp_kinds_mod, only: dp
+  use msp_dict_mod, only: msp_dict
+  use msp_grid_mod, only: msp_grid
+  use msp_matrix_mod
+  use msp_bounds_mod, only: msp_bounds, operator_norms
+  use msp_polynomial_mod, only: msp_polynomial
+  use msp_exponential_mod, only: msp_exp, msp_log
+  use msp_trigonometry_mod, only: msp_sin, msp_cos
+  use msp_inverse_mod, only: msp_inverse, msp_pseudo_inverse, msp_root, &
+       & msp_inverse_root
+  use msp_sign_mod, only: msp_sign, msp_polar
+  use msp_linear_mod, only: msp_cg, msp_cholesky, msp_pivoted_cholesky
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_allocations
+#:endif
+  use spectral_mod, only: spectrum, distribute, deviation
+  use testing_mod, only: check, finish
+  implicit none
+
+  integer, parameter :: n = 13
+  type(msp_grid), target :: grid
+  logical :: device
+  character(len=16) :: mode
+  integer :: which
+
+  call get_command_argument(1, mode)
+  device = mode == "device"
+  call msp_select_gpu()
+  call MPI_Init()
+  call grid%init(MPI_COMM_WORLD)
+  if (mode /= "" .and. .not. device) call stops(trim(mode))
+  do which = 1, 2
+     call test_all(which == 2)
+  end do
+#:if defined('MSPOLY_GPU')
+  call check(msp_gpu_allocations() == 0, "every device allocation released")
+#:endif
+  call grid%free()
+  call finish("test_functions")
+  call MPI_Finalize()
+
+contains
+
+  !> n points evenly spaced on [low, high].
+  function points(low, high) result(x)
+    real(dp), intent(in) :: low, high
+    real(dp), dimension(n) :: x
+    integer :: i
+
+    x = [(low + (high - low) * (i - 1) / (n - 1.0_dp), i = 1, n)]
+  end function points
+
+  !> A matrix with eigenvalues d and the eigenvectors used throughout.
+  subroutine make(m, d, cplx)
+    type(msp_matrix), intent(inout) :: m
+    real(dp), dimension(n), intent(in) :: d
+    logical, intent(in) :: cplx
+
+    call distribute(m, spectrum(d, cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+  end subroutine make
+
+  !> The dense U f(D) U^H for the eigenvalues f(D).
+  function reference(fd, cplx) result(m)
+    real(dp), dimension(n), intent(in) :: fd
+    logical, intent(in) :: cplx
+    complex(dp), dimension(n, n) :: m
+
+    m = spectrum(fd, cplx, 1.3_dp, 0.7_dp)
+  end function reference
+
+  subroutine test_all(cplx)
+    logical, intent(in) :: cplx
+    character(len=2) :: tag
+
+    tag = merge("c:", "r:", cplx)
+    call test_polynomials(cplx, tag)
+    call test_elementary(cplx, tag)
+    call test_inverses(cplx, tag)
+    call test_sign(cplx, tag)
+    call test_linear(cplx, tag)
+  end subroutine test_all
+
+  subroutine test_polynomials(cplx, tag)
+    logical, intent(in) :: cplx
+    character(*), intent(in) :: tag
+    real(dp), dimension(8), parameter :: c = [0.5_dp, -1.0_dp, 0.25_dp, &
+         & 2.0_dp, -0.75_dp, 0.3_dp, 1.1_dp, -0.4_dp]
+    real(dp), dimension(12), parameter :: t = [0.3_dp, -0.2_dp, 0.5_dp, &
+         & 0.1_dp, -0.4_dp, 0.25_dp, 0.05_dp, -0.15_dp, 0.2_dp, -0.1_dp, &
+         & 0.35_dp, -0.3_dp]
+    type(msp_matrix) :: a, b
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: x, p, t0, t1, t2, h0, h1, h2
+    integer :: k
+
+    x = points(-0.9_dp, 0.9_dp)
+    call make(a, x, cplx)
+
+    p = 0
+    do k = size(c), 1, -1
+       p = p * x + c(k)
+    end do
+    call args%set("coefficients", c)
+    call msp_polynomial(a, b, args, info)
+    call check(deviation(b, reference(p, cplx)) < 1.0e-12_dp .and. &
+         & info%get_int("degree") == 7, tag // " monomial by Horner's rule")
+    call args%set("method", "paterson_stockmeyer")
+    call msp_polynomial(a, b, args, info)
+    call check(deviation(b, reference(p, cplx)) < 1.0e-12_dp, &
+         & tag // " monomial by Paterson-Stockmeyer")
+
+    t0 = 1
+    t1 = x
+    p = t(1) * t0 + t(2) * t1
+    do k = 3, size(t)
+       t2 = 2 * x * t1 - t0
+       p = p + t(k) * t2
+       t0 = t1
+       t1 = t2
+    end do
+    call args%clear()
+    call args%set("coefficients", t)
+    call args%set("basis", "chebyshev")
+    call msp_polynomial(a, b, args, info)
+    call check(deviation(b, reference(p, cplx)) < 1.0e-12_dp, &
+         & tag // " Chebyshev by recurrence")
+    call args%set("method", "factorized")
+    call msp_polynomial(a, b, args, info)
+    call check(deviation(b, reference(p, cplx)) < 1.0e-12_dp, &
+         & tag // " Chebyshev factorized")
+
+    h0 = 1
+    h1 = 2 * x
+    p = c(1) * h0 + c(2) * h1
+    do k = 3, size(c)
+       h2 = 2 * x * h1 - 2 * (k - 2) * h0
+       p = p + c(k) * h2
+       h0 = h1
+       h1 = h2
+    end do
+    call args%clear()
+    call args%set("coefficients", c)
+    call args%set("basis", "hermite")
+    call msp_polynomial(a, b, args, info)
+    call check(deviation(b, reference(p, cplx)) < 1.0e-12_dp, &
+         & tag // " Hermite")
+    call a%free()
+    call b%free()
+  end subroutine test_polynomials
+
+  subroutine test_elementary(cplx, tag)
+    logical, intent(in) :: cplx
+    character(*), intent(in) :: tag
+    type(msp_matrix) :: a, b
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: x, y
+
+    x = points(-3.0_dp, 3.0_dp)
+    call make(a, x, cplx)
+    call msp_exp(a, b, args, info)
+    call check(deviation(b, reference(exp(x), cplx)) < 1.0e-11_dp .and. &
+         & info%get_int("squarings") > 0, tag // " exponential by Taylor")
+    call args%set("method", "chebyshev")
+    call msp_exp(a, b, args, info)
+    call check(deviation(b, reference(exp(x), cplx)) < 1.0e-11_dp, &
+         & tag // " exponential by Chebyshev")
+    call args%set("method", "pade")
+    call args%set("tolerance", 1.0e-14_dp)
+    call msp_exp(a, b, args, info)
+    call check(deviation(b, reference(exp(x), cplx)) < 1.0e-10_dp .and. &
+         & info%get_logical("cg.converged"), tag // " exponential by Pade")
+    call args%clear()
+    call msp_sin(a, b, args, info)
+    call check(deviation(b, reference(sin(x), cplx)) < 1.0e-12_dp .and. &
+         & info%get_int("doublings") > 0, tag // " sine")
+    call msp_cos(a, b, args, info)
+    call check(deviation(b, reference(cos(x), cplx)) < 1.0e-12_dp, &
+         & tag // " cosine")
+
+    y = exp(points(-2.0_dp, 2.0_dp))
+    call make(a, y, cplx)
+    call args%set("tolerance", 1.0e-14_dp)
+    call msp_log(a, b, args, info)
+    call check(deviation(b, reference(log(y), cplx)) < 1.0e-10_dp .and. &
+         & info%get_int("square_roots") > 0, tag // " logarithm")
+    call a%free()
+    call b%free()
+  end subroutine test_elementary
+
+  subroutine test_inverses(cplx, tag)
+    logical, intent(in) :: cplx
+    character(*), intent(in) :: tag
+    type(msp_matrix) :: a, b
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: x, y, z
+    character(len=40) :: label
+    integer :: p
+
+    x = points(-5.0_dp, -0.5_dp)
+    x(n) = 2
+    call make(a, x, cplx)
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_inverse(a, b, args, info)
+    call check(deviation(b, reference(1 / x, cplx)) < 1.0e-10_dp .and. &
+         & info%get_logical("converged"), tag // " inverse")
+
+    z = x
+    z(1:3) = 0
+    call make(a, z, cplx)
+    call msp_pseudo_inverse(a, b, args, info)
+    y = 0
+    y(4:) = 1 / z(4:)
+    call check(deviation(b, reference(y, cplx)) < 1.0e-10_dp, &
+         & tag // " pseudo-inverse")
+
+    y = points(0.2_dp, 4.0_dp)
+    call make(a, y, cplx)
+    do p = 1, 5
+       call args%set("root", p)
+       call info%clear()
+       call msp_root(a, b, args, info)
+       write (label, '(a, i0)') " root ", p
+       call check(deviation(b, reference(y**(1.0_dp / p), cplx)) < &
+            & 1.0e-9_dp, tag // trim(label))
+       call info%clear()
+       call msp_inverse_root(a, b, args, info)
+       write (label, '(a, i0)') " inverse root ", p
+       call check(deviation(b, reference(y**(-1.0_dp / p), cplx)) < &
+            & 1.0e-9_dp, tag // trim(label))
+    end do
+    call args%set("max_iterations", 1)
+    call msp_inverse_root(a, b, args, info)
+    call check(.not. info%get_logical("converged"), &
+         & tag // " root non-convergence reported")
+    call a%free()
+    call b%free()
+  end subroutine test_inverses
+
+  subroutine test_sign(cplx, tag)
+    logical, intent(in) :: cplx
+    character(*), intent(in) :: tag
+    type(msp_matrix) :: a, u, h
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: x, s
+    real(dp) :: one, infinity
+    complex(dp), dimension(n, n) :: w, da
+    integer :: i
+
+    x = points(-4.0_dp, -0.5_dp)
+    x(n) = 1
+    call make(a, x, cplx)
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_sign(a, u, args, info)
+    call check(deviation(u, reference(sign(1.0_dp, x), cplx)) < 1.0e-10_dp &
+         & .and. info%get_logical("converged"), tag // " sign")
+
+    !! A = W H with W a unitary reflector and H positive definite with
+    !! other eigenvectors: the polar factors are W and H, and A^(-1) is
+    !! H^(-1) W.
+    s = points(0.5_dp, 3.0_dp)
+    w = spectrum([(1.0_dp, i = 1, n - 1), -1.0_dp], cplx, 0.9_dp, 0.3_dp)
+    da = matmul(w, spectrum(s, cplx, 0.2_dp, 1.7_dp))
+    call distribute(a, da, grid, cplx, device)
+    call msp_polar(a, u, args, info, H=h)
+    call check(deviation(u, w) < 1.0e-10_dp .and. &
+         & deviation(h, spectrum(s, cplx, 0.2_dp, 1.7_dp)) < 1.0e-10_dp, &
+         & tag // " polar decomposition")
+    call msp_inverse(a, u, args, info)
+    call check(deviation(u, matmul(spectrum(1 / s, cplx, 0.2_dp, 1.7_dp), &
+         & w)) < 1.0e-10_dp, tag // " inverse of a non-Hermitian matrix")
+
+    x = points(-2.0_dp, 6.0_dp)
+    call make(a, x, cplx)
+    call args%clear()
+    call args%set("method", "power")
+    call args%set("max_iterations", 500)
+    call args%set("tolerance", 1.0e-10_dp)
+    call info%clear()
+    call msp_bounds(a, args, info)
+    call check(abs(info%get_real("largest") - 6) < 1.0e-6_dp .and. &
+         & info%get_logical("converged"), tag // " power method")
+    x = 0
+    call make(a, x, cplx)
+    call msp_bounds(a, args, info)
+    call check(info%get_real("largest") == 0 .and. &
+         & info%get_logical("converged") .and. &
+         & info%get_string("stop") == "zero_operator", &
+         & tag // " power method on the zero operator")
+    call args%clear()
+    call msp_pseudo_inverse(a, u, args, info)
+    call check(msp_norm(u) == 0 .and. info%get_logical("converged"), &
+         & tag // " zero pseudo-inverse")
+    call args%set("method", "power")
+    da = 0
+    da(1:2, 1:2) = reshape([1.0_dp, -1.0_dp, -1.0_dp, 1.0_dp], [2, 2])
+    call distribute(a, da, grid, cplx, device)
+    call msp_bounds(a, args, info)
+    call check(.not. info%get_logical("converged") .and. &
+         & info%get_string("stop") == "empty_start", &
+         & tag // " power method reports a nullspace start")
+    if (cplx) then
+       da = 0
+       do i = 1, n
+          da(i, i) = (0.0_dp, 1.0_dp)
+       end do
+       call distribute(a, da, grid, cplx, device)
+       call operator_norms(a, one, infinity)
+       call check(one == 1 .and. infinity == 1, "imaginary diagonal norms")
+       call args%clear()
+       call msp_inverse(a, u, args, info)
+       call check(deviation(u, -da) < 1.0e-12_dp .and. &
+            & info%get_logical("converged"), "inverse of i times identity")
+    end if
+    call a%free()
+    call u%free()
+    call h%free()
+  end subroutine test_sign
+
+  subroutine test_linear(cplx, tag)
+    logical, intent(in) :: cplx
+    character(*), intent(in) :: tag
+    type(msp_matrix) :: a, b, x, l, lh, product
+    type(msp_dict) :: args, info
+    complex(dp), dimension(n, n) :: db
+    real(dp), dimension(n) :: y
+    real(dp), allocatable :: history(:)
+    integer, dimension(:), allocatable :: i, j, pivots
+    complex(dp), dimension(:), allocatable :: v
+    integer :: k
+
+    y = points(0.5_dp, 4.0_dp)
+    call make(a, y, cplx)
+    db = spectrum(points(-1.0_dp, 1.0_dp), cplx, 0.4_dp, 1.1_dp)
+    call distribute(b, db, grid, cplx, device)
+    call args%set("tolerance", 1.0e-12_dp)
+    call msp_cg(a, x, b, args, info)
+    call check(deviation(x, matmul(reference(1 / y, cplx), db)) < &
+         & 1.0e-10_dp .and. info%get_logical("converged"), &
+         & tag // " conjugate gradients")
+    y = 2
+    call make(a, y, cplx)
+    call args%set("max_iterations", 1)
+    call info%clear()
+    call msp_cg(a, x, b, args, info)
+    call info%get("residual_history", history)
+    call check(deviation(x, 0.5_dp * db) < 1.0e-12_dp .and. &
+         & info%get_logical("converged") .and. &
+         & info%get_int("iterations") == 1 .and. size(history) == 2 .and. &
+         & history(size(history)) <= 1.0e-12_dp, &
+         & tag // " CG convergence on the final allowed update")
+    call msp_scale(b, 0.0_dp)
+    call args%set("max_iterations", 0)
+    call info%clear()
+    call msp_cg(a, x, b, args, info)
+    call check(info%get_logical("converged") .and. &
+         & info%get_int("iterations") == 0 .and. msp_norm(x) == 0, &
+         & tag // " CG recognizes an initially solved system")
+    call args%clear()
+    y = points(0.5_dp, 4.0_dp)
+    call make(a, y, cplx)
+
+    call msp_cholesky(a, l, args, info)
+    call l%entries(i, j, v)
+    call msp_transpose(l, lh, conjugate=.true.)
+    call msp_multiply(l, lh, product)
+    call check(deviation(product, reference(y, cplx)) < 1.0e-12_dp .and. &
+         & all([(i(k) >= j(k), k = 1, size(i))]), tag // " Cholesky")
+
+    !! A positive semidefinite matrix of rank 4.
+    y = 0
+    y(1:4) = [1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp]
+    call make(a, y, cplx)
+    call args%clear()
+    call args%set("rank", n)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call msp_transpose(l, lh, conjugate=.true.)
+    call msp_multiply(l, lh, product)
+    call check(deviation(product, reference(y, cplx)) < 1.0e-12_dp .and. &
+         & info%get_int("rank") == 4, tag // " pivoted Cholesky to full rank")
+    call args%set("rank", 2)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call check(info%get_int("rank") == 2 .and. l%nnz() <= 2 * n, &
+         & tag // " pivoted Cholesky to a given rank")
+    y = 0
+    y(1:4) = 1
+    call make(a, y, cplx)
+    call args%set("rank", 4)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call msp_transpose(l, lh, conjugate=.true.)
+    call msp_multiply(lh, l, product)
+    db = 0
+    do k = 1, 4
+       db(k, k) = 1
+    end do
+    call check(deviation(product, db) < 1.0e-12_dp, &
+         & tag // " projector Cholesky gives an orthonormal basis")
+    call args%set("rank", 0)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call check(info%get_int("rank") == 0 .and. l%nnz() == 0, &
+         & tag // " zero requested Cholesky rank")
+    db = 0
+    do k = 1, n
+       db(k, k) = k
+    end do
+    db(n - 1, n - 1) = n
+    call distribute(a, db, grid, cplx, device)
+    call msp_to_single(a)
+    call args%set("rank", n + 1)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call info%get("pivots", pivots)
+    call msp_transpose(l, lh, conjugate=.true.)
+    call msp_multiply(l, lh, product)
+    call check(all(pivots == [n - 1, n, (k, k = n - 2, 1, -1)]) .and. &
+         & deviation(product, db) < 2.0e-6_dp .and. l%is_single() .and. &
+         & (l%on_device() .eqv. device) .and. &
+         & (l%is_complex() .eqv. cplx), tag // " Cholesky pivots and kind")
+    db = 0
+    call distribute(a, db, grid, cplx, device)
+    call msp_pivoted_cholesky(a, l, args, info)
+    call check(info%get_int("rank") == 0 .and. l%nnz() == 0, &
+         & tag // " zero matrix Cholesky rank")
+    call a%free()
+    call b%free()
+    call x%free()
+    call l%free()
+    call lh%free()
+    call product%free()
+  end subroutine test_linear
+
+  !> Calls that must stop the program with a message.
+  subroutine stops(what)
+    character(*), intent(in) :: what
+    type(msp_matrix) :: a, b
+    type(msp_dict) :: args, info
+
+    call make(a, points(1.0_dp, 2.0_dp), .false.)
+    call args%set("coefficients", [1.0_dp])
+    select case (what)
+    case ("basis")
+       call args%set("basis", "legendre")
+       call msp_polynomial(a, b, args, info)
+    case ("method")
+       call args%set("method", "estrin")
+       call msp_polynomial(a, b, args, info)
+    case ("exp_method")
+       call args%set("method", "krylov")
+       call msp_exp(a, b, args, info)
+    case ("bounds_method")
+       call args%set("method", "lanczos")
+       call msp_bounds(a, args, info)
+    case ("log_roots")
+       call make(a, points(1.0_dp, 100.0_dp), .false.)
+       call args%set("max_square_roots", 1)
+       call msp_log(a, b, args, info)
+    case ("root")
+       call args%set("root", 0)
+       call msp_root(a, b, args, info)
+    case ("cholesky")
+       call make(a, points(-1.0_dp, 1.0_dp), .false.)
+       call msp_cholesky(a, b, args, info)
+    case ("cholesky_backend")
+       call args%set("rank", 1)
+       call args%set("backend", "missing")
+       call msp_pivoted_cholesky(a, b, args, info)
+    end select
+    write (*, '(a)') "did not stop"
+  end subroutine stops
+end program test_functions

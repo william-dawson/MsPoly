@@ -1,0 +1,86 @@
+#! Storage types: (name, host type, GPU type)
+#:set TYPES = [('r', 'msp_csr_r', 'msp_gpu_csr_r'), ('c', 'msp_csr_c', 'msp_gpu_csr_c'), &
+               ('rs', 'msp_csr_rs', 'msp_gpu_csr_rs'), ('cs', 'msp_csr_cs', 'msp_gpu_csr_cs')]
+!> The storage contract, called directly. Without arguments: converting
+!> storage between precisions keeps its values. Otherwise the call must
+!> stop: mode add, dot, multiply_a or multiply_b with a storage type (r, c,
+!> rs, cs on the host; gr, gc, grs, gcs on the GPU) whose operation receives
+!> an operand of another type; mode real with storage c or cs (complex
+!> storage converted to real); mode matrix (assigning a matrix); mode device
+!> (no GPU support or no GPU).
+program test_storage
+  use msp_kinds_mod, only: dp
+#:if defined('MSPOLY_GPU')
+  use mpi_f08, only: MPI_Init, MPI_COMM_WORLD
+  use msp_grid_mod, only: msp_grid
+#:endif
+  use msp_storage_mod, only: msp_storage
+  use msp_csr_mod, only: msp_csr_r, msp_csr_c, msp_csr_rs, msp_csr_cs
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_csr_r, msp_gpu_csr_c, msp_gpu_csr_rs, &
+       & msp_gpu_csr_cs
+#:endif
+  use msp_matrix_mod, only: msp_matrix, msp_to_device
+  use testing_mod, only: check, finish
+  implicit none
+
+  type(msp_csr_r) :: r
+  type(msp_csr_c) :: c
+  class(msp_storage), allocatable :: x, y, p
+  type(msp_matrix) :: a, b
+#:if defined('MSPOLY_GPU')
+  type(msp_grid), target :: g
+#:endif
+  character(len=12) :: mode, kind
+  complex(dp) :: d
+
+  call r%build(2, 2, [1, 2], [1, 2], [1.0_dp, 2.0_dp])
+  call c%build(2, 2, [1, 2], [1, 2], [(1.0_dp, 1.0_dp), (2.0_dp, 0.0_dp)])
+  call get_command_argument(1, mode)
+  call get_command_argument(2, kind)
+  select case (kind)
+#:for name, host, gpu in TYPES
+  case ("${name}$")
+     allocate(${host}$ :: x)
+  #:if defined('MSPOLY_GPU')
+  case ("g${name}$")
+     allocate(${gpu}$ :: x)
+  #:endif
+#:endfor
+  end select
+  !! The operand: real double storage, or complex for real double receivers.
+  call r%copy_to(y)
+  if (kind == "r" .or. kind == "gr") call c%copy_to(y)
+
+  select case (mode)
+  case ("add")
+     call x%add(y, (1.0_dp, 0.0_dp), 0.0_dp)
+  case ("dot")
+     d = x%dot(y)
+  case ("multiply_a")
+     call x%multiply(y, x, (1.0_dp, 0.0_dp), (0.0_dp, 0.0_dp), 0.0_dp)
+  case ("multiply_b")
+     call x%multiply(x, y, (1.0_dp, 0.0_dp), (0.0_dp, 0.0_dp), 0.0_dp)
+  case ("real")
+     call c%convert_to(x, .true., kind == "cs")
+     call x%convert_to(p, .false., .false.)
+  case ("matrix")
+     a = b
+  case ("device")
+#:if defined('MSPOLY_GPU')
+     call MPI_Init()
+     call g%init(MPI_COMM_WORLD)
+     call a%init(g, 2)
+#:endif
+     call msp_to_device(a)
+  case default
+     call c%convert_to(p, .true., .true.)
+     call p%convert_to(x, .true., .false.)
+     call check(x%is_complex() .and. .not. x%is_single() .and. &
+          & abs(x%dot(c) - 6.0_dp) < 1.0e-12_dp, &
+          & "converting storage between precisions keeps its values")
+     call finish("test_storage")
+     stop
+  end select
+  write (*, '(A)') "did not stop"
+end program test_storage

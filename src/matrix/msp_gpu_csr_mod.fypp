@@ -1,0 +1,605 @@
+#! (suffix, value type, bytes per value, MPI datatype, is complex, is single,
+#!  value type number of msp_gpu_convert)
+#:set KINDS = [('r', 'real(dp)', 8, 'MPI_DOUBLE_PRECISION', '.false.', '.false.', 0), &
+               ('c', 'complex(dp)', 16, 'MPI_DOUBLE_COMPLEX', '.true.', '.false.', 1), &
+               ('rs', 'real(sp)', 4, 'MPI_REAL', '.false.', '.true.', 2), &
+               ('cs', 'complex(sp)', 8, 'MPI_COMPLEX', '.true.', '.true.', 3)]
+!> CSR storage in GPU memory.
+!>
+!> Arrays live in device memory from a stream-ordered pool: creating them is
+!> cheap and kernels read them at full memory bandwidth, which fresh system
+!> memory does not give. Pieces must be dropped with msp_free, which returns
+!> the memory; msp_gpu_allocations counts what is still held. Bands are
+!> exchanged with CUDA-aware MPI directly from device memory.
+module msp_gpu_csr_mod
+  use, intrinsic :: iso_c_binding, only: c_int, c_long, c_double, c_size_t, &
+       & c_ptr, c_null_ptr, c_loc, c_f_pointer, c_associated
+  use mpi_f08, only: MPI_Comm, MPI_COMM_TYPE_SHARED, MPI_INFO_NULL, &
+       & MPI_INTEGER, MPI_DOUBLE_PRECISION, MPI_DOUBLE_COMPLEX, MPI_REAL, &
+       & MPI_COMPLEX, &
+       & MPI_Comm_split_type, MPI_Comm_rank, MPI_Comm_size, MPI_Comm_free, &
+       & MPI_Allgather, MPI_Allgatherv
+  use msp_kinds_mod, only: dp, sp, i64
+  use msp_error_mod, only: msp_raise
+  use msp_storage_mod, only: msp_storage, msp_free
+  use msp_csr_mod, only: msp_csr_r, msp_csr_c, msp_csr_rs, msp_csr_cs
+  implicit none
+  private
+
+  public :: msp_gpu_csr_r, msp_gpu_csr_c, msp_gpu_csr_rs, msp_gpu_csr_cs, &
+       & msp_gpu_select, msp_upload, msp_download, msp_host_copy, &
+       & msp_gpu_allocations
+
+#:for k, ty, bytes, mpit, cplx, single, code in KINDS
+  type, extends(msp_storage) :: msp_gpu_csr_${k}$
+     integer :: count = 0
+     type(c_ptr) :: row_ptr = c_null_ptr
+     type(c_ptr) :: col = c_null_ptr
+     type(c_ptr) :: val = c_null_ptr
+   contains
+     procedure :: release => release_${k}$
+     procedure :: is_complex => is_complex_${k}$
+     procedure :: is_single => is_single_${k}$
+     procedure :: nnz => nnz_${k}$
+     procedure :: copy_to => copy_to_${k}$
+     procedure :: convert_to => convert_to_${k}$
+     procedure :: scale => scale_${k}$
+     procedure :: add => add_${k}$
+     procedure :: dot => dot_${k}$
+     procedure :: trace => trace_${k}$
+     procedure :: norm2 => norm2_${k}$
+     procedure :: gather_rows => gather_rows_${k}$
+     procedure :: gather_cols => gather_cols_${k}$
+     procedure :: multiply => multiply_${k}$
+  end type msp_gpu_csr_${k}$
+
+#:endfor
+  interface
+     integer(c_int) function msp_gpu_init(local_rank) bind(C)
+       import :: c_int
+       integer(c_int), value :: local_rank
+     end function msp_gpu_init
+     type(c_ptr) function msp_gpu_alloc(bytes) bind(C)
+       import :: c_ptr, c_size_t
+       integer(c_size_t), value :: bytes
+     end function msp_gpu_alloc
+     subroutine msp_gpu_free(p) bind(C)
+       import :: c_ptr
+       type(c_ptr), value :: p
+     end subroutine msp_gpu_free
+     integer(c_long) function msp_gpu_allocations() bind(C)
+       import :: c_long
+     end function msp_gpu_allocations
+     integer(c_int) function msp_gpu_copy(dst, src, bytes) bind(C)
+       import :: c_ptr, c_size_t, c_int
+       type(c_ptr), value :: dst, src
+       integer(c_size_t), value :: bytes
+     end function msp_gpu_copy
+     integer(c_int) function msp_gpu_set_ints(p, n, value) bind(C)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: p
+       integer(c_int), value :: n, value
+     end function msp_gpu_set_ints
+     integer(c_int) function msp_gpu_convert(n, from, x, to, y) bind(C)
+       import :: c_long, c_ptr, c_int
+       integer(c_long), value :: n
+       integer(c_int), value :: from, to
+       type(c_ptr), value :: x, y
+     end function msp_gpu_convert
+     integer(c_int) function msp_gpu_concat_rows(rows, parts, rp, starts, &
+          & shifts, bytes, col, val, out_p, out_c, out_v) bind(C)
+       import :: c_int, c_ptr
+       integer(c_int), value :: rows, parts, bytes
+       type(c_ptr), value :: rp, col, val, out_p, out_c, out_v
+       integer(c_int), dimension(*) :: starts, shifts
+     end function msp_gpu_concat_rows
+     integer(c_int) function msp_gpu_stack_rows(parts, heights, starts, rp, &
+          & out_p) bind(C)
+       import :: c_int, c_ptr
+       integer(c_int), value :: parts
+       integer(c_int), dimension(*) :: heights, starts
+       type(c_ptr), value :: rp, out_p
+     end function msp_gpu_stack_rows
+#:for k, ty, bytes, mpit, cplx, single, code in KINDS
+     integer(c_int) function msp_gpu_scale_${k}$(n, v, re, im) bind(C)
+       import :: c_long, c_double, c_ptr, c_int
+       integer(c_long), value :: n
+       type(c_ptr), value :: v
+       real(c_double), value :: re, im
+     end function msp_gpu_scale_${k}$
+     integer(c_int) function msp_gpu_add_${k}$(rows, yp, yc, yv, xp, xc, xv, &
+          & re, im, threshold, out_p, out_c, out_v, fill, total) bind(C)
+       import :: c_int, c_double, c_ptr
+       integer(c_int), value :: rows, fill
+       type(c_ptr), value :: yp, yc, yv, xp, xc, xv, out_p, out_c, out_v
+       real(c_double), value :: re, im, threshold
+       integer(c_int), intent(out) :: total
+     end function msp_gpu_add_${k}$
+     subroutine msp_gpu_dot_${k}$(rows, ap, ac, av, bp, bc, bv, out) bind(C)
+       import :: c_int, c_double, c_ptr
+       integer(c_int), value :: rows
+       type(c_ptr), value :: ap, ac, av, bp, bc, bv
+       real(c_double), dimension(2) :: out
+     end subroutine msp_gpu_dot_${k}$
+     subroutine msp_gpu_trace_${k}$(rows, row0, col0, rp, col, val, out) &
+          & bind(C)
+       import :: c_int, c_double, c_ptr
+       integer(c_int), value :: rows, row0, col0
+       type(c_ptr), value :: rp, col, val
+       real(c_double), dimension(2) :: out
+     end subroutine msp_gpu_trace_${k}$
+     real(c_double) function msp_gpu_norm2_${k}$(n, v) bind(C)
+       import :: c_long, c_double, c_ptr
+       integer(c_long), value :: n
+       type(c_ptr), value :: v
+     end function msp_gpu_norm2_${k}$
+     integer(c_int) function msp_gpu_product_start_${k}$(m, n, ap, ac, av, &
+          & bp, bc, bv, re, im, cp, cc, cv, beta_re, beta_im, threshold, &
+          & state, nnz) bind(C)
+       import :: c_int, c_long, c_double, c_ptr
+       integer(c_int), value :: m, n
+       type(c_ptr), value :: ap, ac, av, bp, bc, bv, cp, cc, cv
+       real(c_double), value :: re, im, beta_re, beta_im, threshold
+       type(c_ptr), intent(out) :: state
+       integer(c_long), intent(out) :: nnz
+     end function msp_gpu_product_start_${k}$
+     integer(c_int) function msp_gpu_product_finish_${k}$(state, cp, cc, cv) &
+          & bind(C)
+       import :: c_int, c_ptr
+       type(c_ptr), value :: state, cp, cc, cv
+     end function msp_gpu_product_finish_${k}$
+#:endfor
+  end interface
+
+  logical :: ready = .false.
+
+contains
+
+  !> Bind this process to a GPU of its node from the local rank set by the
+  !> launcher (Open MPI, MPICH or Slurm). Callable before MPI_Init. Without
+  !> such a local rank or a usable GPU it does nothing; msp_upload then
+  !> binds the GPU on first use.
+  subroutine msp_gpu_select()
+    character(len=32), dimension(3), parameter :: names = [character(32) :: &
+         & "OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "SLURM_LOCALID"]
+    character(len=16) :: value
+    integer :: k, length, status, rank
+
+    do k = 1, size(names)
+       call get_environment_variable(trim(names(k)), value, length, status)
+       if (status /= 0 .or. length == 0) cycle
+       read (value, *) rank
+       ready = msp_gpu_init(rank) == 0
+       return
+    end do
+  end subroutine msp_gpu_select
+
+  !> Move a host piece to the GPU. The first call binds each rank of comm to
+  !> a GPU of its node (local rank modulo device count).
+  subroutine msp_upload(local, comm)
+    class(msp_storage), allocatable, intent(inout) :: local
+    type(MPI_Comm), intent(in) :: comm
+    class(msp_storage), allocatable :: gpu
+    type(MPI_Comm) :: node
+    integer :: rank
+
+    if (.not. ready) then
+       call MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &
+            & node)
+       call MPI_Comm_rank(node, rank)
+       call MPI_Comm_free(node)
+       if (msp_gpu_init(rank) /= 0) call msp_raise("msp_gpu: no usable GPU")
+       ready = .true.
+    end if
+    select type (local)
+#:for k, ty, bytes, mpit, cplx, single, code in KINDS
+    type is (msp_csr_${k}$)
+       allocate(msp_gpu_csr_${k}$ :: gpu)
+       select type (gpu)
+       type is (msp_gpu_csr_${k}$)
+          call upload_${k}$(gpu, local)
+       end select
+#:endfor
+    end select
+    if (.not. allocated(gpu)) return
+    call msp_free(local)
+    call move_alloc(gpu, local)
+  end subroutine msp_upload
+
+  !> Move a GPU piece back to host storage.
+  subroutine msp_download(local)
+    class(msp_storage), allocatable, intent(inout) :: local
+    class(msp_storage), allocatable :: host
+
+    call msp_host_copy(local, host)
+    if (.not. allocated(host)) return
+    call msp_free(local)
+    call move_alloc(host, local)
+  end subroutine msp_download
+
+  !> host becomes a host copy of a GPU piece; unallocated for other pieces.
+  subroutine msp_host_copy(local, host)
+    class(msp_storage), intent(in) :: local
+    class(msp_storage), allocatable, intent(inout) :: host
+
+    call msp_free(host)
+    select type (local)
+#:for k, ty, bytes, mpit, cplx, single, code in KINDS
+    type is (msp_gpu_csr_${k}$)
+       allocate(msp_csr_${k}$ :: host)
+       select type (host)
+       type is (msp_csr_${k}$)
+          call download_${k}$(host, local)
+       end select
+#:endfor
+    end select
+  end subroutine msp_host_copy
+
+  subroutine check(code, what)
+    integer(c_int), intent(in) :: code
+    character(*), intent(in) :: what
+    character(len=12) :: text
+
+    write (text, '(I0)') code
+    if (code /= 0) call msp_raise("msp_gpu: " // what // " failed (code " // &
+         & trim(text) // ")")
+  end subroutine check
+
+  !> Device memory for n items of `bytes` bytes each.
+  type(c_ptr) function device(n, bytes) result(p)
+    integer, intent(in) :: n, bytes
+
+    p = msp_gpu_alloc(int(max(n, 1), c_size_t) * bytes)
+    if (.not. c_associated(p)) call msp_raise("msp_gpu: out of device memory")
+  end function device
+
+  !> The device array p of n integers, as a Fortran pointer (for MPI).
+  function ints(p, n) result(a)
+    type(c_ptr), intent(in) :: p
+    integer, intent(in) :: n
+    integer, dimension(:), pointer :: a
+
+    call c_f_pointer(p, a, [n])
+  end function ints
+
+  !> Offsets of consecutive blocks of the given sizes, starting at 0.
+  pure function starts_of(sizes) result(s)
+    integer, dimension(:), intent(in) :: sizes
+    integer, dimension(size(sizes)) :: s
+    integer :: p
+
+    s(1) = 0
+    do p = 2, size(sizes)
+       s(p) = s(p - 1) + sizes(p - 1)
+    end do
+  end function starts_of
+
+#:for k, ty, bytes, mpit, cplx, single, code in KINDS
+  subroutine release_${k}$(this)
+    class(msp_gpu_csr_${k}$), intent(inout) :: this
+
+    call msp_gpu_free(this%row_ptr)
+    call msp_gpu_free(this%col)
+    call msp_gpu_free(this%val)
+    this%row_ptr = c_null_ptr
+    this%col = c_null_ptr
+    this%val = c_null_ptr
+    this%count = 0
+  end subroutine release_${k}$
+
+  !> Give s device arrays for rows x cols with n entries.
+  subroutine shape_${k}$(s, rows, cols, n)
+    type(msp_gpu_csr_${k}$), intent(inout) :: s
+    integer, intent(in) :: rows, cols, n
+
+    call s%release()
+    s%rows = rows
+    s%cols = cols
+    s%count = n
+    s%row_ptr = device(rows + 1, 4)
+    s%col = device(n, 4)
+    s%val = device(n, ${bytes}$)
+  end subroutine shape_${k}$
+
+  !> Hand the arrays of s to this, releasing those of this.
+  subroutine take_${k}$(this, s)
+    class(msp_gpu_csr_${k}$), intent(inout) :: this
+    type(msp_gpu_csr_${k}$), intent(inout) :: s
+
+    call this%release()
+    this%rows = s%rows
+    this%cols = s%cols
+    this%count = s%count
+    this%row_ptr = s%row_ptr
+    this%col = s%col
+    this%val = s%val
+    s%row_ptr = c_null_ptr
+    s%col = c_null_ptr
+    s%val = c_null_ptr
+  end subroutine take_${k}$
+
+  subroutine upload_${k}$(g, h)
+    type(msp_gpu_csr_${k}$), intent(inout) :: g
+    type(msp_csr_${k}$), intent(in), target :: h
+
+    call shape_${k}$(g, h%rows, h%cols, size(h%col))
+    call check(msp_gpu_copy(g%row_ptr, c_loc(h%row_ptr), int(h%rows + 1, &
+         & c_size_t) * 4), "upload")
+    if (g%count == 0) return
+    call check(msp_gpu_copy(g%col, c_loc(h%col), int(g%count, c_size_t) * 4), &
+         & "upload")
+    call check(msp_gpu_copy(g%val, c_loc(h%val), int(g%count, c_size_t) * &
+         & ${bytes}$), "upload")
+  end subroutine upload_${k}$
+
+  subroutine download_${k}$(h, g)
+    type(msp_csr_${k}$), intent(inout), target :: h
+    type(msp_gpu_csr_${k}$), intent(in) :: g
+
+    h%rows = g%rows
+    h%cols = g%cols
+    allocate(h%row_ptr(g%rows + 1), h%col(g%count), h%val(g%count))
+    call check(msp_gpu_copy(c_loc(h%row_ptr), g%row_ptr, int(g%rows + 1, &
+         & c_size_t) * 4), "download")
+    if (g%count == 0) return
+    call check(msp_gpu_copy(c_loc(h%col), g%col, int(g%count, c_size_t) * 4), &
+         & "download")
+    call check(msp_gpu_copy(c_loc(h%val), g%val, int(g%count, c_size_t) * &
+         & ${bytes}$), "download")
+  end subroutine download_${k}$
+
+  logical function is_complex_${k}$(this) result(c)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+
+    c = ${cplx}$
+    if (this%rows < 0) c = .not. c
+  end function is_complex_${k}$
+
+  logical function is_single_${k}$(this) result(s)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+
+    s = ${single}$
+    if (this%rows < 0) s = .not. s
+  end function is_single_${k}$
+
+  integer(i64) function nnz_${k}$(this) result(n)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+
+    n = this%count
+  end function nnz_${k}$
+
+  subroutine copy_to_${k}$(this, dst)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    class(msp_storage), allocatable, intent(inout) :: dst
+
+    call msp_free(dst)
+    allocate(msp_gpu_csr_${k}$ :: dst)
+    select type (dst)
+    type is (msp_gpu_csr_${k}$)
+       call shape_${k}$(dst, this%rows, this%cols, this%count)
+       call check(msp_gpu_copy(dst%row_ptr, this%row_ptr, int(this%rows + 1, &
+            & c_size_t) * 4), "copy")
+       call check(msp_gpu_copy(dst%col, this%col, int(this%count, c_size_t) &
+            & * 4), "copy")
+       call check(msp_gpu_copy(dst%val, this%val, int(this%count, c_size_t) &
+            & * ${bytes}$), "copy")
+    end select
+  end subroutine copy_to_${k}$
+
+  subroutine convert_to_${k}$(this, dst, cplx, single)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    class(msp_storage), allocatable, intent(inout) :: dst
+    logical, intent(in) :: cplx, single
+
+    call msp_free(dst)
+  #:for t, tty, tbytes, tmpit, tcplx, tsingle, tcode in KINDS
+    if ((cplx .eqv. ${tcplx}$) .and. (single .eqv. ${tsingle}$)) &
+         & allocate(msp_gpu_csr_${t}$ :: dst)
+  #:endfor
+    select type (dst)
+  #:for t, tty, tbytes, tmpit, tcplx, tsingle, tcode in KINDS
+    type is (msp_gpu_csr_${t}$)
+       call shape_${t}$(dst, this%rows, this%cols, this%count)
+       call check(msp_gpu_copy(dst%row_ptr, this%row_ptr, int(this%rows + 1, &
+            & c_size_t) * 4), "convert")
+       call check(msp_gpu_copy(dst%col, this%col, int(this%count, c_size_t) &
+            & * 4), "convert")
+       call check(msp_gpu_convert(int(this%count, c_long), ${code}$, &
+            & this%val, ${tcode}$, dst%val), "convert")
+  #:endfor
+    end select
+  end subroutine convert_to_${k}$
+
+  subroutine scale_${k}$(this, alpha)
+    class(msp_gpu_csr_${k}$), intent(inout) :: this
+    complex(dp), intent(in) :: alpha
+
+    call check(msp_gpu_scale_${k}$(int(this%count, c_long), this%val, &
+         & alpha%re, alpha%im), "scale")
+  end subroutine scale_${k}$
+
+  !> this = alpha * x + this, dropping |value| < threshold: count the kept
+  !> entries per row, allocate, then fill.
+  subroutine add_${k}$(this, x, alpha, threshold)
+    class(msp_gpu_csr_${k}$), intent(inout) :: this
+    class(msp_storage), intent(in) :: x
+    complex(dp), intent(in) :: alpha
+    real(dp), intent(in) :: threshold
+    type(msp_gpu_csr_${k}$) :: sum
+    integer(c_int) :: total
+
+    select type (x)
+    type is (msp_gpu_csr_${k}$)
+       call shape_${k}$(sum, this%rows, this%cols, 0)
+       call check(msp_gpu_add_${k}$(this%rows, this%row_ptr, this%col, &
+            & this%val, x%row_ptr, x%col, x%val, alpha%re, alpha%im, &
+            & threshold, sum%row_ptr, sum%col, sum%val, 0, total), "add")
+       call msp_gpu_free(sum%col)
+       call msp_gpu_free(sum%val)
+       sum%count = total
+       sum%col = device(total, 4)
+       sum%val = device(total, ${bytes}$)
+       call check(msp_gpu_add_${k}$(this%rows, this%row_ptr, this%col, &
+            & this%val, x%row_ptr, x%col, x%val, alpha%re, alpha%im, &
+            & threshold, sum%row_ptr, sum%col, sum%val, 1, total), "add")
+       call take_${k}$(this, sum)
+    class default
+       call msp_raise("msp_gpu: operands of different storage types")
+    end select
+  end subroutine add_${k}$
+
+  complex(dp) function dot_${k}$(this, x) result(d)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    class(msp_storage), intent(in) :: x
+    real(c_double), dimension(2) :: out
+
+    d = 0
+    select type (x)
+    type is (msp_gpu_csr_${k}$)
+       call msp_gpu_dot_${k}$(this%rows, this%row_ptr, this%col, this%val, &
+            & x%row_ptr, x%col, x%val, out)
+       d = cmplx(out(1), out(2), dp)
+    class default
+       call msp_raise("msp_gpu: operands of different storage types")
+    end select
+  end function dot_${k}$
+
+  complex(dp) function trace_${k}$(this, row0, col0) result(t)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    integer, intent(in) :: row0, col0
+    real(c_double), dimension(2) :: out
+
+    call msp_gpu_trace_${k}$(this%rows, row0, col0, this%row_ptr, this%col, &
+         & this%val, out)
+    t = cmplx(out(1), out(2), dp)
+  end function trace_${k}$
+
+  real(dp) function norm2_${k}$(this) result(s)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+
+    s = msp_gpu_norm2_${k}$(int(this%count, c_long), this%val)
+  end function norm2_${k}$
+
+  !> Pieces side by side: gather every piece's arrays into device buffers,
+  !> then join each row from its parts with a kernel.
+  subroutine gather_rows_${k}$(this, comm, band)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    type(MPI_Comm), intent(in) :: comm
+    class(msp_storage), allocatable, intent(inout) :: band
+    integer, dimension(:), allocatable :: widths, counts
+    type(c_ptr) :: rp, col, val
+    integer :: parts
+
+    call MPI_Comm_size(comm, parts)
+    allocate(widths(parts), counts(parts))
+    call MPI_Allgather(this%cols, 1, MPI_INTEGER, widths, 1, MPI_INTEGER, comm)
+    call MPI_Allgather(this%count, 1, MPI_INTEGER, counts, 1, MPI_INTEGER, comm)
+    rp = device(parts * (this%rows + 1), 4)
+    col = device(sum(counts), 4)
+    val = device(sum(counts), ${bytes}$)
+    call MPI_Allgather(ints(this%row_ptr, this%rows + 1), this%rows + 1, &
+         & MPI_INTEGER, ints(rp, parts * (this%rows + 1)), this%rows + 1, &
+         & MPI_INTEGER, comm)
+    call exchange_${k}$(this, comm, counts, col, val)
+    call msp_free(band)
+    allocate(msp_gpu_csr_${k}$ :: band)
+    select type (band)
+    type is (msp_gpu_csr_${k}$)
+       call shape_${k}$(band, this%rows, sum(widths), sum(counts))
+       call check(msp_gpu_concat_rows(this%rows, parts, rp, starts_of(counts), &
+            & starts_of(widths), ${bytes}$, col, val, band%row_ptr, band%col, &
+            & band%val), "concat")
+    end select
+    call msp_gpu_free(rp)
+    call msp_gpu_free(col)
+    call msp_gpu_free(val)
+  end subroutine gather_rows_${k}$
+
+  !> Pieces stacked: entries are gathered straight into the band, row
+  !> offsets are shifted by a kernel.
+  subroutine gather_cols_${k}$(this, comm, band)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    type(MPI_Comm), intent(in) :: comm
+    class(msp_storage), allocatable, intent(inout) :: band
+    integer, dimension(:), allocatable :: heights, counts
+    type(c_ptr) :: rp
+    integer :: parts
+
+    call MPI_Comm_size(comm, parts)
+    allocate(heights(parts), counts(parts))
+    call MPI_Allgather(this%rows, 1, MPI_INTEGER, heights, 1, MPI_INTEGER, comm)
+    call MPI_Allgather(this%count, 1, MPI_INTEGER, counts, 1, MPI_INTEGER, comm)
+    rp = device(sum(heights) + parts, 4)
+    call MPI_Allgatherv(ints(this%row_ptr, this%rows + 1), this%rows + 1, &
+         & MPI_INTEGER, ints(rp, sum(heights) + parts), heights + 1, &
+         & starts_of(heights + 1), MPI_INTEGER, comm)
+    call msp_free(band)
+    allocate(msp_gpu_csr_${k}$ :: band)
+    select type (band)
+    type is (msp_gpu_csr_${k}$)
+       call shape_${k}$(band, sum(heights), this%cols, sum(counts))
+       call exchange_${k}$(this, comm, counts, band%col, band%val)
+       call check(msp_gpu_stack_rows(parts, heights, starts_of(counts), rp, &
+            & band%row_ptr), "stack")
+    end select
+    call msp_gpu_free(rp)
+  end subroutine gather_cols_${k}$
+
+  !> Gather the entries of every piece of comm, in rank order, into col and
+  !> val (device memory).
+  subroutine exchange_${k}$(this, comm, counts, col, val)
+    class(msp_gpu_csr_${k}$), intent(in) :: this
+    type(MPI_Comm), intent(in) :: comm
+    integer, dimension(:), intent(in) :: counts
+    type(c_ptr), intent(in) :: col, val
+    ${ty}$, dimension(:), pointer :: mine, all
+
+    call MPI_Allgatherv(ints(this%col, this%count), this%count, MPI_INTEGER, &
+         & ints(col, sum(counts)), counts, starts_of(counts), MPI_INTEGER, comm)
+    call c_f_pointer(this%val, mine, [this%count])
+    call c_f_pointer(val, all, [sum(counts)])
+    call MPI_Allgatherv(mine, this%count, ${mpit}$, all, counts, &
+         & starts_of(counts), ${mpit}$, comm)
+  end subroutine exchange_${k}$
+
+  !> this = alpha * a * b + beta * this, accumulated together in double
+  !> precision.
+  subroutine multiply_${k}$(this, a, b, alpha, beta, threshold)
+    class(msp_gpu_csr_${k}$), intent(inout) :: this
+    class(msp_storage), intent(in) :: a, b
+    complex(dp), intent(in) :: alpha, beta
+    real(dp), intent(in) :: threshold
+    type(msp_gpu_csr_${k}$) :: p
+    type(c_ptr) :: state
+    integer(c_long) :: nnz
+    logical :: work
+
+    select type (a)
+    type is (msp_gpu_csr_${k}$)
+       select type (b)
+       type is (msp_gpu_csr_${k}$)
+          work = (a%count > 0 .and. b%count > 0) .or. &
+               & (beta /= 0 .and. this%count > 0)
+          nnz = 0
+          if (work) call check(msp_gpu_product_start_${k}$(a%rows, b%cols, &
+               & a%row_ptr, a%col, a%val, b%row_ptr, b%col, b%val, alpha%re, &
+               & alpha%im, this%row_ptr, this%col, this%val, beta%re, &
+               & beta%im, threshold, state, nnz), "product")
+          call shape_${k}$(p, a%rows, b%cols, int(nnz))
+          if (work) then
+             call check(msp_gpu_product_finish_${k}$(state, p%row_ptr, p%col, &
+                  & p%val), "product")
+          else
+             call check(msp_gpu_set_ints(p%row_ptr, a%rows + 1, 1), "product")
+          end if
+          call take_${k}$(this, p)
+       class default
+          call msp_raise("msp_gpu: operands of different storage types")
+       end select
+    class default
+       call msp_raise("msp_gpu: operands of different storage types")
+    end select
+  end subroutine multiply_${k}$
+
+#:endfor
+end module msp_gpu_csr_mod

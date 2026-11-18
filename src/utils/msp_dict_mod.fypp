@@ -1,0 +1,1703 @@
+#! Base value types: (suffix, Fortran type, type constant)
+#:set BASE = [('l', 'logical', 'MSP_LOGICAL'), &
+              ('i', 'integer(i64)', 'MSP_INTEGER'), &
+              ('r', 'real(dp)', 'MSP_REAL'), &
+              ('c', 'complex(dp)', 'MSP_COMPLEX')]
+#:set ALL = [t[0] for t in BASE] + ['s', 'i32_']
+#:set FMT = {'l': 'format_logical', 'i': 'format_int', 'r': 'format_real', &
+            'c': 'format_complex'}
+#:set TYPE = {'l': 'logical', 'i': 'integer(i64)', 'r': 'real(dp)', &
+             'c': 'complex(dp)', 'i32_': 'integer(i32)'}
+!> Keyword dictionary: the argument and report container of the MsPoly API.
+!>
+!> A value is one of: a base type (logical, integer, real, complex, string),
+!> a rank-1 array of a base type, or a nested msp_dict. Values are stored
+!> in unlimited polymorphic components and cast with SELECT TYPE on access.
+!> Keys are single segments of [A-Za-z0-9_]; procedures also accept dotted
+!> paths ("bounds.max_iterations") that walk nested dictionaries, creating
+!> them on write.
+!>
+!> Entries are sorted by key, so output and hashing are deterministic.
+!> Dictionaries only hold owned values. They cannot be assigned; copy them
+!> with copy(dst, src).
+module msp_dict_mod
+  use, intrinsic :: iso_fortran_env, only: int8
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_is_finite
+  use msp_kinds_mod, only: dp, i32, i64
+  use msp_error_mod, only: msp_raise, msp_clear
+  implicit none
+  private
+
+  !> Value type constants.
+  integer, parameter, public :: MSP_NONE = 0
+  integer, parameter, public :: MSP_LOGICAL = 1
+  integer, parameter, public :: MSP_INTEGER = 2
+  integer, parameter, public :: MSP_REAL = 3
+  integer, parameter, public :: MSP_COMPLEX = 4
+  integer, parameter, public :: MSP_STRING = 5
+  integer, parameter, public :: MSP_DICTIONARY = 6
+
+  public :: msp_dict, msp_args, msp_info, msp_type_name, copy
+
+  type :: entry_t
+     character(:), allocatable :: key
+     !> Scalar base value or nested msp_dict.
+     class(*), allocatable :: v
+     !> Rank-1 array of a base type.
+     class(*), dimension(:), allocatable :: a
+     !> Set when an msp_args view reads this entry.
+     logical :: used = .false.
+  end type entry_t
+
+  type :: msp_dict
+     private
+     type(entry_t), dimension(:), allocatable :: e
+     integer :: n = 0
+   contains
+#:for t in ALL
+     generic :: set => set_${t}$0, set_${t}$1
+     generic :: get => get_${t}$0, get_${t}$1
+     generic :: append => append_${t}$
+     procedure, private :: set_${t}$0, set_${t}$1, get_${t}$0, get_${t}$1, &
+          & append_${t}$
+#:endfor
+     generic :: set => set_dict
+     generic :: get => get_dict
+     procedure, private :: set_dict, get_dict
+     procedure :: get_logical, get_int, get_real, get_complex, get_string
+     procedure :: has, remove, clear, num_keys, key_at, type_of, length_of
+     procedure :: include
+     procedure :: write_yaml, hash, unused_keys, pack, unpack
+     procedure, private :: put, fetch, mark_used, find, collect_unused
+     procedure, private :: include_path
+     !> Assignment is a deep copy, done explicitly (see copy_entry).
+     generic :: assignment(=) => no_copy
+     procedure, private :: no_copy
+  end type msp_dict
+
+  !> Read-only, scoped view of an argument dictionary used inside the library.
+  !>
+  !> A view sits at a scope path ("" at the top, "bounds" in a nested call).
+  !> get() looks up scope.key; with scoped=.true. it then tries each outer
+  !> scope in turn, so a key set once at the top reaches any routine below
+  !> that asks for it. The context dictionary is searched last with the same
+  !> rule. Every key found in the arguments is marked as used.
+  type :: msp_args
+     private
+     type(msp_dict), pointer :: root => null()
+     type(msp_dict), pointer :: context => null()
+     character(:), allocatable :: scope
+   contains
+     procedure :: open => args_open
+     procedure :: enter => args_enter
+     procedure :: finish => args_finish
+     procedure :: has => args_has
+#:for t in ALL
+     generic :: get => args_get_${t}$0, args_get_${t}$1
+     procedure, private :: args_get_${t}$0, args_get_${t}$1
+#:endfor
+     procedure, private :: resolve
+  end type msp_args
+
+  !> Write view of a report dictionary at a scope path.
+  type :: msp_info
+     private
+     type(msp_dict), pointer :: root => null()
+     character(:), allocatable :: scope
+   contains
+     procedure :: open => info_open
+     procedure :: enter => info_enter
+     procedure :: cite => info_cite
+#:for t in ALL
+     generic :: set => info_set_${t}$0, info_set_${t}$1
+     generic :: append => info_append_${t}$
+     procedure, private :: info_set_${t}$0, info_set_${t}$1, info_append_${t}$
+#:endfor
+  end type msp_info
+
+  type :: string_t
+     character(:), allocatable :: s
+  end type string_t
+
+  !> Deep copy of a dictionary.
+  interface copy
+     module procedure copy_dict
+  end interface copy
+
+contains
+
+!!! Keys and entries ----------------------------------------------------------
+
+  pure logical function valid_segment(key) result(ok)
+    character(*), intent(in) :: key
+    integer :: k
+    character :: ch
+
+    ok = len(key) > 0
+    do k = 1, len(key)
+       ch = key(k:k)
+       ok = ok .and. (('a' <= ch .and. ch <= 'z') .or. &
+            & ('A' <= ch .and. ch <= 'Z') .or. ('0' <= ch .and. ch <= '9') &
+            & .or. ch == '_')
+    end do
+  end function valid_segment
+
+  !> True if path is one or more valid segments separated by single dots.
+  pure logical function valid_path(path) result(ok)
+    character(*), intent(in) :: path
+    integer :: start, dot
+
+    start = 1
+    do
+       dot = index(path(start:), '.')
+       if (dot == 0) then
+          ok = valid_segment(path(start:))
+          return
+       end if
+       ok = valid_segment(path(start:start + dot - 2))
+       if (.not. ok) return
+       start = start + dot
+    end do
+  end function valid_path
+
+  pure function join(scope, key) result(path)
+    character(*), intent(in) :: scope, key
+    character(:), allocatable :: path
+
+    if (len(scope) == 0) then
+       path = key
+    else
+       path = scope // '.' // key
+    end if
+  end function join
+
+  !> Index of key in this level, or minus its insertion position.
+  pure integer function find(this, key) result(idx)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    integer :: lo, hi, mid
+
+    lo = 1
+    hi = this%n
+    do while (lo <= hi)
+       mid = (lo + hi) / 2
+       if (this%e(mid)%key == key) then
+          idx = mid
+          return
+       else if (llt(this%e(mid)%key, key)) then
+          lo = mid + 1
+       else
+          hi = mid - 1
+       end if
+    end do
+    idx = -lo
+  end function find
+
+  integer function entry_type(en) result(vtype)
+    type(entry_t), intent(in) :: en
+
+    vtype = MSP_NONE
+    if (allocated(en%a)) then
+       select type (x => en%a)
+       type is (logical)
+          vtype = MSP_LOGICAL
+       type is (integer(i64))
+          vtype = MSP_INTEGER
+       type is (real(dp))
+          vtype = MSP_REAL
+       type is (complex(dp))
+          vtype = MSP_COMPLEX
+       type is (character(*))
+          vtype = MSP_STRING
+       end select
+    else if (allocated(en%v)) then
+       select type (x => en%v)
+       type is (logical)
+          vtype = MSP_LOGICAL
+       type is (integer(i64))
+          vtype = MSP_INTEGER
+       type is (real(dp))
+          vtype = MSP_REAL
+       type is (complex(dp))
+          vtype = MSP_COMPLEX
+       type is (character(*))
+          vtype = MSP_STRING
+       type is (msp_dict)
+          vtype = MSP_DICTIONARY
+       end select
+    end if
+  end function entry_type
+
+  function msp_type_name(vtype, is_array) result(name)
+    integer, intent(in) :: vtype
+    logical, intent(in) :: is_array
+    character(:), allocatable :: name
+
+    select case (vtype)
+    case (MSP_LOGICAL)
+       name = "logical"
+    case (MSP_INTEGER)
+       name = "integer"
+    case (MSP_REAL)
+       name = "real"
+    case (MSP_COMPLEX)
+       name = "complex"
+    case (MSP_STRING)
+       name = "string"
+    case (MSP_DICTIONARY)
+       name = "dictionary"
+    case default
+       name = "nothing"
+    end select
+    if (is_array) name = name // " array"
+  end function msp_type_name
+
+  !> Empty an entry.
+  subroutine reset_entry(en)
+    type(entry_t), intent(inout) :: en
+
+    if (allocated(en%key)) deallocate(en%key)
+    if (allocated(en%v)) deallocate(en%v)
+    if (allocated(en%a)) deallocate(en%a)
+    en%used = .false.
+  end subroutine reset_entry
+
+  !> Deep copy of an entry.
+  recursive subroutine copy_entry(dst, src)
+    type(entry_t), intent(inout) :: dst
+    type(entry_t), intent(in) :: src
+
+    call reset_entry(dst)
+    if (allocated(src%key)) dst%key = src%key
+    dst%used = src%used
+    if (allocated(src%v)) then
+       select type (x => src%v)
+       type is (msp_dict)
+          allocate(msp_dict :: dst%v)
+          select type (y => dst%v)
+          type is (msp_dict)
+             call copy_dict(y, x)
+          end select
+#:for t, ty, vt in BASE
+       type is (${ty}$)
+          allocate(${ty}$ :: dst%v)
+          select type (y => dst%v)
+          type is (${ty}$)
+             y = x
+          end select
+#:endfor
+       type is (character(*))
+          allocate(character(len=len(x)) :: dst%v)
+          select type (y => dst%v)
+          type is (character(*))
+             y = x
+          end select
+       end select
+    end if
+    if (allocated(src%a)) then
+       select type (x => src%a)
+#:for t, ty, vt in BASE
+       type is (${ty}$)
+          allocate(${ty}$ :: dst%a(size(x)))
+          select type (y => dst%a)
+          type is (${ty}$)
+             y = x
+          end select
+#:endfor
+       type is (character(*))
+          allocate(character(len=len(x)) :: dst%a(size(x)))
+          select type (y => dst%a)
+          type is (character(*))
+             y = x
+          end select
+       end select
+    end if
+  end subroutine copy_entry
+
+  !> dst becomes an independent deep copy of src.
+  recursive subroutine copy_dict(dst, src)
+    type(msp_dict), intent(inout) :: dst
+    type(msp_dict), intent(in) :: src
+    integer :: k
+
+    call dst%clear()
+    if (src%n == 0) return
+    allocate(dst%e(src%n))
+    do k = 1, src%n
+       call copy_entry(dst%e(k), src%e(k))
+    end do
+    dst%n = src%n
+  end subroutine copy_dict
+
+  subroutine no_copy(lhs, rhs)
+    class(msp_dict), intent(inout) :: lhs
+    class(msp_dict), intent(in) :: rhs
+
+    if (lhs%n < 0 .or. rhs%n < 0) continue
+    error stop "msp_dict: a dictionary cannot be assigned; use copy(dst, src)"
+  end subroutine no_copy
+
+  function describe(en) result(name)
+    type(entry_t), intent(in) :: en
+    character(:), allocatable :: name
+
+    name = msp_type_name(entry_type(en), allocated(en%a))
+  end function describe
+
+  !> Store en at path, creating intermediate dictionaries.
+  recursive subroutine put(this, path, en, full, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: path
+    type(entry_t), intent(in) :: en
+    !> Complete path for error messages.
+    character(*), intent(in) :: full
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t), dimension(:), allocatable :: grown
+    integer :: dot, pos, k
+    character(:), allocatable :: head
+
+    call msp_clear(stat)
+    !! Validate the whole path before creating any section.
+    if (len(path) == len(full)) then
+       if (.not. valid_path(full)) then
+          call msp_raise("msp_dict: invalid key '" // full // "'", stat, &
+               & errmsg)
+          return
+       end if
+    end if
+    dot = index(path, '.')
+    if (dot == 0) then
+       head = path
+    else
+       head = path(1:dot-1)
+    end if
+    pos = this%find(head)
+    if (pos < 0) then
+       pos = -pos
+       if (.not. allocated(this%e)) allocate(this%e(4))
+       if (this%n == size(this%e)) then
+          allocate(grown(2 * size(this%e)))
+          do k = 1, this%n
+             call copy_entry(grown(k), this%e(k))
+          end do
+          call move_alloc(grown, this%e)
+       end if
+       do k = this%n, pos, -1
+          call copy_entry(this%e(k+1), this%e(k))
+       end do
+       this%n = this%n + 1
+       call reset_entry(this%e(pos))
+       this%e(pos)%key = head
+       if (dot > 0) allocate(msp_dict :: this%e(pos)%v)
+    end if
+    if (dot == 0) then
+       call copy_entry(this%e(pos), en)
+       this%e(pos)%key = head
+       return
+    end if
+    if (entry_type(this%e(pos)) /= MSP_DICTIONARY) then
+       call msp_raise("msp_dict: cannot set '" // full // "': '" // head // &
+            & "' holds " // describe(this%e(pos)), stat, errmsg)
+       return
+    end if
+    select type (sub => this%e(pos)%v)
+    type is (msp_dict)
+       call sub%put(path(dot+1:), en, full, stat, errmsg)
+    end select
+  end subroutine put
+
+  !> Copy of the entry at path, if any.
+  recursive subroutine fetch(this, path, en, found)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: path
+    type(entry_t), intent(out) :: en
+    logical, intent(out) :: found
+    integer :: dot, pos
+
+    found = .false.
+    dot = index(path, '.')
+    if (dot == 0) then
+       pos = this%find(path)
+       if (pos > 0) then
+          call copy_entry(en, this%e(pos))
+          found = .true.
+       end if
+       return
+    end if
+    pos = this%find(path(1:dot-1))
+    if (pos <= 0) return
+    select type (sub => this%e(pos)%v)
+    type is (msp_dict)
+       call sub%fetch(path(dot+1:), en, found)
+    end select
+  end subroutine fetch
+
+  recursive subroutine mark_used(this, path)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: path
+    integer :: dot, pos
+
+    dot = index(path, '.')
+    if (dot == 0) then
+       pos = this%find(path)
+       if (pos > 0) this%e(pos)%used = .true.
+       return
+    end if
+    pos = this%find(path(1:dot-1))
+    if (pos <= 0) return
+    select type (sub => this%e(pos)%v)
+    type is (msp_dict)
+       call sub%mark_used(path(dot+1:))
+    end select
+  end subroutine mark_used
+
+  !> Record path as true in a logical set. Existing members are updated
+  !> in place, without allocating or copying their values.
+  subroutine include(this, path, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: path
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call msp_clear(stat)
+    if (.not. valid_path(path)) then
+       call msp_raise("msp_dict: invalid key '" // path // "'", stat, errmsg)
+       return
+    end if
+    call this%include_path(path, path, stat, errmsg)
+  end subroutine include
+
+  recursive subroutine include_path(this, path, full, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: path, full
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    integer :: dot, pos
+
+    call msp_clear(stat)
+    dot = index(path, '.')
+    if (dot == 0) then
+       pos = this%find(path)
+    else
+       pos = this%find(path(1:dot - 1))
+    end if
+    if (pos < 0) then
+       allocate(logical :: en%v)
+       select type (flag => en%v)
+       type is (logical)
+          flag = .true.
+       end select
+       call this%put(path, en, full, stat, errmsg)
+       return
+    end if
+    if (dot > 0 .and. entry_type(this%e(pos)) == MSP_DICTIONARY) then
+       select type (sub => this%e(pos)%v)
+       type is (msp_dict)
+          call sub%include_path(path(dot + 1:), full, stat, errmsg)
+          return
+       end select
+    else if (dot == 0 .and. .not. allocated(this%e(pos)%a)) then
+       select type (flag => this%e(pos)%v)
+       type is (logical)
+          flag = .true.
+          return
+       end select
+    end if
+    call msp_raise("msp_dict: '" // full // &
+         & "' is not a logical set member", stat, errmsg)
+  end subroutine include_path
+
+  logical function has(this, path)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: path
+    type(entry_t) :: en
+
+    call this%fetch(path, en, has)
+  end function has
+
+  !> Value type at path (MSP_NONE if absent).
+  integer function type_of(this, path)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: path
+    type(entry_t) :: en
+    logical :: found
+
+    call this%fetch(path, en, found)
+    type_of = entry_type(en)
+  end function type_of
+
+  !> Array length at path; 1 for scalars and dictionaries, 0 if absent.
+  integer function length_of(this, path)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: path
+    type(entry_t) :: en
+    logical :: found
+
+    call this%fetch(path, en, found)
+    length_of = 0
+    if (allocated(en%a)) then
+       length_of = size(en%a)
+    else if (allocated(en%v)) then
+       length_of = 1
+    end if
+  end function length_of
+
+  !> Remove the entry at path (a nested dictionary goes with its contents).
+  recursive subroutine remove(this, path)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: path
+    integer :: dot, pos, k
+
+    dot = index(path, '.')
+    if (dot == 0) then
+       pos = this%find(path)
+       if (pos <= 0) return
+       do k = pos, this%n - 1
+          call copy_entry(this%e(k), this%e(k+1))
+       end do
+       call reset_entry(this%e(this%n))
+       this%n = this%n - 1
+       return
+    end if
+    pos = this%find(path(1:dot-1))
+    if (pos <= 0) return
+    select type (sub => this%e(pos)%v)
+    type is (msp_dict)
+       call sub%remove(path(dot+1:))
+    end select
+  end subroutine remove
+
+  subroutine clear(this)
+    class(msp_dict), intent(inout) :: this
+
+    if (allocated(this%e)) deallocate(this%e)
+    this%n = 0
+  end subroutine clear
+
+  !> Number of keys at the top level.
+  integer function num_keys(this)
+    class(msp_dict), intent(in) :: this
+
+    num_keys = this%n
+  end function num_keys
+
+  !> k-th top-level key in sorted order.
+  function key_at(this, k) result(key)
+    class(msp_dict), intent(in) :: this
+    integer, intent(in) :: k
+    character(:), allocatable :: key
+
+    key = this%e(k)%key
+  end function key_at
+
+!!! Reading a single entry -----------------------------------------------------
+!!! Shared by msp_dict getters (path lookup) and msp_args getters (scoped).
+
+  subroutine missing_or_default(found, where, has_default, done, stat, errmsg)
+    logical, intent(in) :: found, has_default
+    character(*), intent(in) :: where
+    logical, intent(out) :: done
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call msp_clear(stat)
+    done = .not. found
+    if (done .and. .not. has_default) call msp_raise("missing key '" // &
+         & where // "'", stat, errmsg)
+  end subroutine missing_or_default
+
+  subroutine mismatch(en, where, wanted, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    character(*), intent(in) :: where, wanted
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call msp_raise("key '" // where // "' holds " // describe(en) // &
+         & ", requested " // wanted, stat, errmsg)
+  end subroutine mismatch
+
+#:for t, ty, vt in BASE
+  subroutine read_${t}$0(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    ${ty}$, intent(out) :: value
+    ${ty}$, intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    logical :: done
+
+    call missing_or_default(found, where, present(default), done, stat, errmsg)
+    if (done) then
+       if (present(default)) value = default
+       return
+    end if
+    if (allocated(en%v)) then
+       select type (x => en%v)
+       type is (${ty}$)
+          value = x
+          return
+  #:if t == 'r'
+       type is (integer(i64))
+          value = real(x, dp)
+          return
+  #:endif
+       end select
+    end if
+    call mismatch(en, where, msp_type_name(${vt}$, .false.), stat, errmsg)
+  end subroutine read_${t}$0
+
+  subroutine read_${t}$1(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    ${ty}$, dimension(:), allocatable, intent(out) :: value
+    ${ty}$, dimension(:), intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    logical :: done
+
+    call missing_or_default(found, where, present(default), done, stat, errmsg)
+    if (done) then
+       if (present(default)) value = default
+       return
+    end if
+    if (allocated(en%a)) then
+       select type (x => en%a)
+       type is (${ty}$)
+          value = x
+          return
+  #:if t == 'r'
+       type is (integer(i64))
+          value = real(x, dp)
+          return
+  #:endif
+       end select
+    end if
+    call mismatch(en, where, msp_type_name(${vt}$, .true.), stat, errmsg)
+  end subroutine read_${t}$1
+
+#:endfor
+  subroutine read_i32_0(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    integer(i32), intent(out) :: value
+    integer(i32), intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    integer(i64) :: wide
+    character(:), allocatable :: msg
+    integer :: ierr
+
+    if (found .or. .not. present(default)) then
+       call read_i0(en, found, where, wide, stat=ierr, errmsg=msg)
+       if (ierr /= 0) then
+          call msp_raise(msg, stat, errmsg)
+          return
+       end if
+       if (wide < -int(huge(value), i64) - 1_i64 .or. &
+            & wide > int(huge(value), i64)) then
+          call msp_raise("key '" // where // "' does not fit a default " // &
+               & "integer", stat, errmsg)
+          return
+       end if
+       value = int(wide, i32)
+    else
+       value = default
+    end if
+    call msp_clear(stat)
+  end subroutine read_i32_0
+
+  subroutine read_i32_1(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    integer(i32), dimension(:), allocatable, intent(out) :: value
+    integer(i32), dimension(:), intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    integer(i64), dimension(:), allocatable :: wide
+    character(:), allocatable :: msg
+    integer :: ierr
+
+    if (found .or. .not. present(default)) then
+       call read_i1(en, found, where, wide, stat=ierr, errmsg=msg)
+       if (ierr /= 0) then
+          call msp_raise(msg, stat, errmsg)
+          return
+       end if
+       if (any(wide < -int(huge(1_i32), i64) - 1_i64 .or. &
+            & wide > int(huge(1_i32), i64))) then
+          call msp_raise("key '" // where // "' does not fit a default " // &
+               & "integer", stat, errmsg)
+          return
+       end if
+       value = int(wide, i32)
+    else
+       value = default
+    end if
+    call msp_clear(stat)
+  end subroutine read_i32_1
+
+  subroutine read_s0(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    character(:), allocatable, intent(out) :: value
+    character(*), intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    logical :: done
+
+    call missing_or_default(found, where, present(default), done, stat, errmsg)
+    if (done) then
+       if (present(default)) value = default
+       return
+    end if
+    if (allocated(en%v)) then
+       select type (x => en%v)
+       type is (character(*))
+          value = x
+          return
+       end select
+    end if
+    call mismatch(en, where, "string", stat, errmsg)
+  end subroutine read_s0
+
+  subroutine read_s1(en, found, where, value, default, stat, errmsg)
+    type(entry_t), intent(in) :: en
+    logical, intent(in) :: found
+    character(*), intent(in) :: where
+    character(:), dimension(:), allocatable, intent(out) :: value
+    character(*), dimension(:), intent(in), optional :: default
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    logical :: done
+
+    call missing_or_default(found, where, present(default), done, stat, errmsg)
+    if (done) then
+       if (present(default)) value = default
+       return
+    end if
+    if (allocated(en%a)) then
+       select type (x => en%a)
+       type is (character(*))
+          allocate(character(len=len(x)) :: value(size(x)))
+          value = x
+          return
+       end select
+    end if
+    call mismatch(en, where, "string array", stat, errmsg)
+  end subroutine read_s1
+
+!!! msp_dict setters, getters, append ------------------------------------------
+
+#:for t, ty, vt in BASE + [('s', 'character(*)', 'MSP_STRING')]
+  subroutine set_${t}$0(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    ${ty}$, intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+
+  #:if t == 's'
+    allocate(character(len=len(value)) :: en%v)
+    select type (x => en%v)
+    type is (character(*))
+       x = value
+    end select
+  #:else
+    allocate(en%v, source=value)
+  #:endif
+    call this%put(key, en, key, stat, errmsg)
+  end subroutine set_${t}$0
+
+  subroutine set_${t}$1(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    ${ty}$, dimension(:), intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+
+  #:if t == 's'
+    allocate(character(len=len(value)) :: en%a(size(value)))
+  #:else
+    allocate(${ty}$ :: en%a(size(value)))
+  #:endif
+    select type (x => en%a)
+    type is (${ty}$)
+       x = value
+    end select
+    call this%put(key, en, key, stat, errmsg)
+  end subroutine set_${t}$1
+
+#:endfor
+  subroutine set_i32_0(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    integer(i32), intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call this%set_i0(key, int(value, i64), stat, errmsg)
+  end subroutine set_i32_0
+
+  subroutine set_i32_1(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    integer(i32), dimension(:), intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    integer(i64), dimension(:), allocatable :: wide
+
+    wide = int(value, i64)
+    call this%set_i1(key, wide, stat, errmsg)
+  end subroutine set_i32_1
+
+  !> Store a copy of a dictionary at key.
+  subroutine set_dict(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    type(msp_dict), intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+
+    allocate(msp_dict :: en%v)
+    select type (x => en%v)
+    type is (msp_dict)
+       call copy_dict(x, value)
+    end select
+    call this%put(key, en, key, stat, errmsg)
+  end subroutine set_dict
+
+#:for t in ALL
+  subroutine get_${t}$0(this, key, value, default, stat, errmsg)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+  #:if t == 's'
+    character(:), allocatable, intent(out) :: value
+    character(*), intent(in), optional :: default
+  #:else
+    ${TYPE[t]}$, intent(out) :: value
+    ${TYPE[t]}$, intent(in), optional :: default
+  #:endif
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    logical :: found
+
+    call this%fetch(key, en, found)
+    call read_${t}$0(en, found, key, value, default, stat, errmsg)
+  end subroutine get_${t}$0
+
+  subroutine get_${t}$1(this, key, value, default, stat, errmsg)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+  #:if t == 's'
+    character(:), dimension(:), allocatable, intent(out) :: value
+    character(*), dimension(:), intent(in), optional :: default
+  #:else
+    ${TYPE[t]}$, dimension(:), allocatable, intent(out) :: value
+    ${TYPE[t]}$, dimension(:), intent(in), optional :: default
+  #:endif
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    logical :: found
+
+    call this%fetch(key, en, found)
+    call read_${t}$1(en, found, key, value, default, stat, errmsg)
+  end subroutine get_${t}$1
+
+#:endfor
+  !> Copy of the nested dictionary at key.
+  subroutine get_dict(this, key, value, stat, errmsg)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    type(msp_dict), intent(out) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    logical :: found, done
+
+    call this%fetch(key, en, found)
+    call missing_or_default(found, key, .false., done, stat, errmsg)
+    if (done) return
+    if (allocated(en%v)) then
+       select type (x => en%v)
+       type is (msp_dict)
+          call copy_dict(value, x)
+          return
+       end select
+    end if
+    call mismatch(en, key, "dictionary", stat, errmsg)
+  end subroutine get_dict
+
+#:for t, ty, vt in BASE + [('s', 'character(*)', 'MSP_STRING')]
+  !> Append value to the array at key, creating it if absent.
+  subroutine append_${t}$(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    ${ty}$, intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+  #:if t == 's'
+    character(:), dimension(:), allocatable :: old, grown
+    integer :: width
+  #:else
+    ${ty}$, dimension(:), allocatable :: old, grown
+  #:endif
+    type(entry_t) :: en
+    logical :: found
+    integer :: ierr
+
+    call msp_clear(stat)
+    call this%fetch(key, en, found)
+    if (found) then
+       call read_${t}$1(en, found, key, old, stat=ierr, errmsg=errmsg)
+  #:if t == 'r'
+       if (ierr == 0 .and. entry_type(en) /= MSP_REAL) ierr = 1
+  #:endif
+       if (ierr /= 0) then
+          call msp_raise("cannot append " // msp_type_name(${vt}$, .false.) &
+               & // " to '" // key // "', which holds " // describe(en), &
+               & stat, errmsg)
+          return
+       end if
+  #:if t == 's'
+       width = max(len(old), len(value))
+       allocate(character(len=width) :: grown(size(old) + 1))
+       grown(1:size(old)) = old
+       grown(size(old) + 1) = value
+    else
+       allocate(character(len=len(value)) :: grown(1))
+       grown(1) = value
+    end if
+  #:else
+       grown = [old, value]
+    else
+       grown = [value]
+    end if
+  #:endif
+    call this%set(key, grown, stat, errmsg)
+  end subroutine append_${t}$
+
+#:endfor
+  subroutine append_i32_(this, key, value, stat, errmsg)
+    class(msp_dict), intent(inout) :: this
+    character(*), intent(in) :: key
+    integer(i32), intent(in) :: value
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call this%append_i(key, int(value, i64), stat, errmsg)
+  end subroutine append_i32_
+
+  !> Function forms for scalars. A missing key without default stops.
+  logical function get_logical(this, key, default) result(value)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    logical, intent(in), optional :: default
+
+    call this%get(key, value, default)
+  end function get_logical
+
+  integer function get_int(this, key, default) result(value)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    integer, intent(in), optional :: default
+
+    call this%get(key, value, default)
+  end function get_int
+
+  real(dp) function get_real(this, key, default) result(value)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    real(dp), intent(in), optional :: default
+
+    call this%get(key, value, default)
+  end function get_real
+
+  complex(dp) function get_complex(this, key, default) result(value)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    complex(dp), intent(in), optional :: default
+
+    call this%get(key, value, default)
+  end function get_complex
+
+  function get_string(this, key, default) result(value)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: key
+    character(*), intent(in), optional :: default
+    character(:), allocatable :: value
+
+    call this%get(key, value, default)
+  end function get_string
+
+!!! Usage tracking -------------------------------------------------------------
+
+  !> Paths of values that no msp_args view has read.
+  subroutine unused_keys(this, keys)
+    class(msp_dict), intent(in) :: this
+    character(:), dimension(:), allocatable, intent(out) :: keys
+    type(string_t), dimension(:), allocatable :: list
+    integer :: n, k, width
+
+    allocate(list(8))
+    n = 0
+    call this%collect_unused("", list, n)
+    width = 0
+    do k = 1, n
+       width = max(width, len(list(k)%s))
+    end do
+    allocate(character(len=width) :: keys(n))
+    do k = 1, n
+       keys(k) = list(k)%s
+    end do
+  end subroutine unused_keys
+
+  recursive subroutine collect_unused(this, prefix, list, n)
+    class(msp_dict), intent(in) :: this
+    character(*), intent(in) :: prefix
+    type(string_t), dimension(:), allocatable, intent(inout) :: list
+    integer, intent(inout) :: n
+    type(string_t), dimension(:), allocatable :: grown
+    integer :: k
+
+    do k = 1, this%n
+       if (entry_type(this%e(k)) == MSP_DICTIONARY) then
+          select type (sub => this%e(k)%v)
+          type is (msp_dict)
+             call sub%collect_unused(join(prefix, this%e(k)%key), list, n)
+          end select
+       else if (.not. this%e(k)%used) then
+          if (n == size(list)) then
+             allocate(grown(2 * n))
+             grown(1:n) = list(1:n)
+             call move_alloc(grown, list)
+          end if
+          n = n + 1
+          list(n)%s = join(prefix, this%e(k)%key)
+       end if
+    end do
+  end subroutine collect_unused
+
+!!! YAML output and hashing ---------------------------------------------------
+
+  !> Write as YAML, one nesting level per dictionary.
+  recursive subroutine write_yaml(this, unit, indent)
+    class(msp_dict), intent(in) :: this
+    integer, intent(in) :: unit
+    !> Spaces before each key at this level (default 0).
+    integer, intent(in), optional :: indent
+    integer :: k, pad
+
+    pad = 0
+    if (present(indent)) pad = indent
+    do k = 1, this%n
+       associate (en => this%e(k))
+         if (entry_type(en) == MSP_DICTIONARY) then
+            select type (sub => en%v)
+            type is (msp_dict)
+               if (sub%n == 0) then
+                  write (unit, '(A)') repeat(' ', pad) // en%key // ': {}'
+               else
+                  write (unit, '(A)') repeat(' ', pad) // en%key // ':'
+                  call sub%write_yaml(unit, pad + 2)
+               end if
+            end select
+         else
+            write (unit, '(A)') repeat(' ', pad) // en%key // ': ' // &
+                 & format_entry(en)
+         end if
+       end associate
+    end do
+  end subroutine write_yaml
+
+  !> One entry as YAML.
+  function format_entry(en) result(str)
+    type(entry_t), intent(in) :: en
+    character(:), allocatable :: str
+    integer :: k
+
+    if (allocated(en%v)) then
+       select type (x => en%v)
+#:for t, ty, vt in BASE
+       type is (${ty}$)
+          str = ${FMT[t]}$(x)
+#:endfor
+       type is (character(*))
+          str = quote(x)
+       end select
+       return
+    end if
+    str = '['
+    select type (x => en%a)
+#:for t, ty, vt in BASE
+    type is (${ty}$)
+       do k = 1, size(x)
+          if (k > 1) str = str // ', '
+          str = str // ${FMT[t]}$(x(k))
+       end do
+#:endfor
+    type is (character(*))
+       !! Elements of a string array share one length; drop the padding.
+       do k = 1, size(x)
+          if (k > 1) str = str // ', '
+          str = str // quote(trim(x(k)))
+       end do
+    end select
+    str = str // ']'
+  end function format_entry
+
+  function format_logical(x) result(str)
+    logical, intent(in) :: x
+    character(:), allocatable :: str
+
+    if (x) then
+       str = 'true'
+    else
+       str = 'false'
+    end if
+  end function format_logical
+
+  function format_int(x) result(str)
+    integer(i64), intent(in) :: x
+    character(:), allocatable :: str
+    character(len=24) :: buffer
+
+    write (buffer, '(I0)') x
+    str = trim(buffer)
+  end function format_int
+
+  function format_complex(x) result(str)
+    complex(dp), intent(in) :: x
+    character(:), allocatable :: str
+
+    str = '{re: ' // format_real(x%re) // ', im: ' // format_real(x%im) // '}'
+  end function format_complex
+
+  function format_real(x) result(str)
+    real(dp), intent(in) :: x
+    character(:), allocatable :: str
+    character(len=40) :: buffer
+
+    if (ieee_is_nan(x)) then
+       str = '.nan'
+    else if (.not. ieee_is_finite(x)) then
+       str = trim(adjustl(merge(' .inf', '-.inf', x > 0)))
+    else
+       write (buffer, '(ES25.17E3)') x
+       str = trim(adjustl(buffer))
+    end if
+  end function format_real
+
+  function quote(s) result(str)
+    character(*), intent(in) :: s
+    character(:), allocatable :: str
+    character(len=1), parameter :: backslash = achar(92)
+    integer :: k
+
+    str = '"'
+    do k = 1, len(s)
+       if (s(k:k) == '"' .or. s(k:k) == backslash) str = str // backslash
+       str = str // s(k:k)
+    end do
+    str = str // '"'
+  end function quote
+
+  !> Deterministic 62-bit hash of keys, types and values. Equal dictionaries
+  !> hash equally within one build; used to check that all ranks agree.
+  integer(i64) function hash(this)
+    class(msp_dict), intent(in) :: this
+    integer(i64) :: h1, h2
+
+    h1 = 1
+    h2 = 7
+    call hash_into(this, h1, h2)
+    hash = h1 * 2147483648_i64 + h2
+  end function hash
+
+  recursive subroutine hash_into(d, h1, h2)
+    type(msp_dict), intent(in) :: d
+    integer(i64), intent(inout) :: h1, h2
+    integer(int8), dimension(1) :: mold
+    integer :: k, j
+
+    do k = 1, d%n
+       associate (en => d%e(k))
+         call mix(transfer(en%key, mold), h1, h2)
+         call mix(transfer([entry_type(en), merge(1, 0, allocated(en%a))], &
+              & mold), h1, h2)
+         if (allocated(en%v)) then
+            select type (x => en%v)
+            type is (msp_dict)
+               call hash_into(x, h1, h2)
+            type is (logical)
+               call mix(transfer(merge(1, 0, x), mold), h1, h2)
+#:for t, ty, vt in BASE[1:]
+            type is (${ty}$)
+               call mix(transfer(x, mold), h1, h2)
+#:endfor
+            type is (character(*))
+               call mix(transfer(len(x), mold), h1, h2)
+               call mix(transfer(x, mold), h1, h2)
+            end select
+         else if (allocated(en%a)) then
+            call mix(transfer(size(en%a), mold), h1, h2)
+            select type (x => en%a)
+            type is (logical)
+               call mix(transfer(merge(1, 0, x), mold), h1, h2)
+#:for t, ty, vt in BASE[1:]
+            type is (${ty}$)
+               call mix(transfer(x, mold), h1, h2)
+#:endfor
+            type is (character(*))
+               call mix(transfer(len(x), mold), h1, h2)
+               do j = 1, size(x)
+                  call mix(transfer(x(j), mold), h1, h2)
+               end do
+            end select
+         end if
+       end associate
+    end do
+  end subroutine hash_into
+
+  subroutine mix(bytes, h1, h2)
+    integer(int8), dimension(:), intent(in) :: bytes
+    integer(i64), intent(inout) :: h1, h2
+    integer(i64), parameter :: p1 = 2147483647_i64, p2 = 2147483629_i64
+    integer(i64) :: v
+    integer :: b
+
+    do b = 1, size(bytes)
+       v = iand(int(bytes(b), i64), 255_i64) + 1
+       h1 = mod(h1 * 257 + v, p1)
+       h2 = mod(h2 * 263 + v, p2)
+    end do
+  end subroutine mix
+
+!!! Serialization --------------------------------------------------------------
+
+  !> Serialize to bytes, for example to send over MPI. unpack reverses it
+  !> within one build. Usage marks are not kept.
+  subroutine pack(this, bytes)
+    class(msp_dict), intent(in) :: this
+    integer(int8), dimension(:), allocatable, intent(out) :: bytes
+    integer(int8), dimension(:), allocatable :: buffer
+    integer :: n
+
+    allocate(buffer(256))
+    n = 0
+    call pack_into(this, buffer, n)
+    bytes = buffer(1:n)
+  end subroutine pack
+
+  !> Replace the contents with a dictionary serialized by pack.
+  subroutine unpack(this, bytes)
+    class(msp_dict), intent(inout) :: this
+    integer(int8), dimension(:), intent(in) :: bytes
+    integer :: pos
+
+    pos = 1
+    call unpack_from(this, bytes, pos)
+  end subroutine unpack
+
+  !> Layout per dictionary: entry count, then per entry: key length, key,
+  !> type, array flag, element count (arrays), string length (strings), and
+  !> the raw bytes of the values. Nested dictionaries recurse.
+  recursive subroutine pack_into(d, buffer, n)
+    type(msp_dict), intent(in) :: d
+    integer(int8), dimension(:), allocatable, intent(inout) :: buffer
+    integer, intent(inout) :: n
+    integer(int8), dimension(1) :: mold
+    integer :: k
+
+    call emit(transfer(d%n, mold))
+    do k = 1, d%n
+       associate (en => d%e(k))
+         call emit(transfer([len(en%key), entry_type(en), &
+              & merge(1, 0, allocated(en%a))], mold))
+         call emit(transfer(en%key, mold))
+         if (allocated(en%v)) then
+            select type (x => en%v)
+            type is (msp_dict)
+               call pack_into(x, buffer, n)
+            type is (logical)
+               call emit(transfer(merge(1, 0, x), mold))
+#:for t, ty, vt in BASE[1:]
+            type is (${ty}$)
+               call emit(transfer(x, mold))
+#:endfor
+            type is (character(*))
+               call emit(transfer(len(x), mold))
+               call emit(transfer(x, mold))
+            end select
+         else
+            call emit(transfer(size(en%a), mold))
+            select type (x => en%a)
+            type is (logical)
+               call emit(transfer(merge(1, 0, x), mold))
+#:for t, ty, vt in BASE[1:]
+            type is (${ty}$)
+               call emit(transfer(x, mold))
+#:endfor
+            type is (character(*))
+               call emit(transfer(len(x), mold))
+               call emit(transfer(x, mold))
+            end select
+         end if
+       end associate
+    end do
+
+  contains
+
+    subroutine emit(bytes)
+      integer(int8), dimension(:), intent(in) :: bytes
+      integer(int8), dimension(:), allocatable :: grown
+
+      if (n + size(bytes) > size(buffer)) then
+         allocate(grown(max(2 * size(buffer), n + size(bytes))))
+         grown(1:n) = buffer(1:n)
+         call move_alloc(grown, buffer)
+      end if
+      buffer(n + 1:n + size(bytes)) = bytes
+      n = n + size(bytes)
+    end subroutine emit
+  end subroutine pack_into
+
+  recursive subroutine unpack_from(d, bytes, pos)
+    type(msp_dict), intent(inout) :: d
+    integer(int8), dimension(:), intent(in) :: bytes
+    integer, intent(inout) :: pos
+    type(msp_dict) :: sub
+    character(:), allocatable :: key
+    integer :: count, k, header(3), m, width
+#:for t, ty, vt in BASE[1:]
+    ${ty}$, dimension(1) :: one_${t}$
+#:endfor
+
+    call d%clear()
+    count = take_int()
+    do k = 1, count
+       header = [take_int(), take_int(), take_int()]
+       allocate(character(len=header(1)) :: key)
+       key = transfer(bytes(pos:pos + header(1) - 1), key)
+       pos = pos + header(1)
+       if (header(3) == 0) then
+          select case (header(2))
+          case (MSP_DICTIONARY)
+             call unpack_from(sub, bytes, pos)
+             call d%set(key, sub)
+          case (MSP_LOGICAL)
+             call d%set(key, take_int() /= 0)
+#:for t, ty, vt in BASE[1:]
+          case (${vt}$)
+             one_${t}$ = take_${t}$(1)
+             call d%set(key, one_${t}$(1))
+#:endfor
+          case (MSP_STRING)
+             width = take_int()
+             block
+               character(len=width) :: string
+               string = transfer(bytes(pos:pos + width - 1), string)
+               pos = pos + width
+               call d%set(key, string)
+             end block
+          end select
+       else
+          m = take_int()
+          select case (header(2))
+          case (MSP_LOGICAL)
+             call d%set(key, take_ints(m) /= 0)
+#:for t, ty, vt in BASE[1:]
+          case (${vt}$)
+             call d%set(key, take_${t}$(m))
+#:endfor
+          case (MSP_STRING)
+             width = take_int()
+             block
+               character(len=width), dimension(m) :: strings
+               strings = transfer(bytes(pos:pos + width * m - 1), strings, m)
+               pos = pos + width * m
+               call d%set(key, strings)
+             end block
+          end select
+       end if
+       deallocate(key)
+    end do
+
+  contains
+
+    integer function take_int() result(v)
+      v = transfer(bytes(pos:pos + storage_size(v) / 8 - 1), v)
+      pos = pos + storage_size(v) / 8
+    end function take_int
+
+    function take_ints(m) result(v)
+      integer, intent(in) :: m
+      integer, dimension(m) :: v
+      integer :: width
+
+      width = storage_size(1) / 8
+      v = transfer(bytes(pos:pos + width * m - 1), v, m)
+      pos = pos + width * m
+    end function take_ints
+
+#:for t, ty, vt in BASE[1:]
+    function take_${t}$(m) result(v)
+      integer, intent(in) :: m
+      ${ty}$, dimension(m) :: v
+      integer :: width
+
+      width = storage_size(v) / 8
+      v = transfer(bytes(pos:pos + width * m - 1), v, m)
+      pos = pos + width * m
+    end function take_${t}$
+
+#:endfor
+  end subroutine unpack_from
+
+!!! msp_args: scoped, usage-tracked argument views -----------------------------
+
+  !> Top-level view. root must stay alive while views of it are in use; it
+  !> is normally a local copy of the caller's arguments made by the public
+  !> routine, so usage marks never touch the caller's dictionary.
+  subroutine args_open(this, root, context)
+    class(msp_args), intent(inout) :: this
+    type(msp_dict), intent(inout), target :: root
+    type(msp_dict), intent(in), target, optional :: context
+
+    this%root => root
+    this%context => null()
+    if (present(context)) this%context => context
+    this%scope = ""
+  end subroutine args_open
+
+  !> View for a nested call: same arguments, one scope deeper.
+  subroutine args_enter(this, name, inner)
+    class(msp_args), intent(in) :: this
+    character(*), intent(in) :: name
+    type(msp_args), intent(out) :: inner
+
+    inner%root => this%root
+    inner%context => this%context
+    inner%scope = join(this%scope, name)
+  end subroutine args_enter
+
+  !> Find key from this scope outward. where is the path that was found, or
+  !> the local path if nothing was found.
+  !> Whether key is given, looked up as by get: in this scope, or with
+  !> scoped also in enclosing scopes and the context. A key found counts as
+  !> used.
+  logical function args_has(this, key, scoped) result(found)
+    class(msp_args), intent(in) :: this
+    character(*), intent(in) :: key
+    logical, intent(in), optional :: scoped
+    type(entry_t) :: en
+    character(:), allocatable :: where
+
+    call this%resolve(key, scoped, en, found, where)
+  end function args_has
+
+  subroutine resolve(this, key, scoped, en, found, where)
+    class(msp_args), intent(in) :: this
+    character(*), intent(in) :: key
+    logical, intent(in), optional :: scoped
+    type(entry_t), intent(out) :: en
+    logical, intent(out) :: found
+    character(:), allocatable, intent(out) :: where
+    logical :: walk
+    integer :: pass
+
+    walk = .false.
+    if (present(scoped)) walk = scoped
+    found = .false.
+    do pass = 1, 2
+       if (pass == 1) then
+          call search(this%root)
+       else if (associated(this%context)) then
+          call search(this%context)
+       end if
+       if (found) then
+          if (pass == 1) call this%root%mark_used(where)
+          return
+       end if
+    end do
+    where = join(this%scope, key)
+
+  contains
+
+    subroutine search(d)
+      type(msp_dict), intent(in) :: d
+      character(:), allocatable :: s
+      integer :: dot
+
+      s = this%scope
+      do
+         where = join(s, key)
+         call d%fetch(where, en, found)
+         if (found .or. .not. walk .or. len(s) == 0) return
+         dot = index(s, '.', back=.true.)
+         if (dot == 0) then
+            s = ""
+         else
+            s = s(1:dot-1)
+         end if
+      end do
+    end subroutine search
+  end subroutine resolve
+
+#:for t in ALL
+  subroutine args_get_${t}$0(this, key, value, default, scoped, stat, errmsg)
+    class(msp_args), intent(in) :: this
+    character(*), intent(in) :: key
+  #:if t == 's'
+    character(:), allocatable, intent(out) :: value
+    character(*), intent(in), optional :: default
+  #:else
+    ${TYPE[t]}$, intent(out) :: value
+    ${TYPE[t]}$, intent(in), optional :: default
+  #:endif
+    !> Also search enclosing scopes and the context (default: this scope).
+    logical, intent(in), optional :: scoped
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    logical :: found
+    character(:), allocatable :: where
+
+    call this%resolve(key, scoped, en, found, where)
+    call read_${t}$0(en, found, where, value, default, stat, errmsg)
+  end subroutine args_get_${t}$0
+
+  subroutine args_get_${t}$1(this, key, value, default, scoped, stat, errmsg)
+    class(msp_args), intent(in) :: this
+    character(*), intent(in) :: key
+  #:if t == 's'
+    character(:), dimension(:), allocatable, intent(out) :: value
+    character(*), dimension(:), intent(in), optional :: default
+  #:else
+    ${TYPE[t]}$, dimension(:), allocatable, intent(out) :: value
+    ${TYPE[t]}$, dimension(:), intent(in), optional :: default
+  #:endif
+    logical, intent(in), optional :: scoped
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(entry_t) :: en
+    logical :: found
+    character(:), allocatable :: where
+
+    call this%resolve(key, scoped, en, found, where)
+    call read_${t}$1(en, found, where, value, default, stat, errmsg)
+  end subroutine args_get_${t}$1
+
+#:endfor
+  !> End of a public call: report arguments nothing read as
+  !> "unused_arguments" in info. With strict_arguments=.true. in the context
+  !> they are also an error.
+  subroutine args_finish(this, info, stat, errmsg)
+    class(msp_args), intent(in) :: this
+    type(msp_info), intent(inout) :: info
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    character(:), dimension(:), allocatable :: unused
+    character(:), allocatable :: list
+    logical :: strict
+    integer :: k
+
+    call msp_clear(stat)
+    call this%root%unused_keys(unused)
+    if (size(unused) == 0) return
+    call info%root%set("unused_arguments", unused)
+    strict = .false.
+    if (associated(this%context)) &
+         & call this%context%get("strict_arguments", strict, .false.)
+    if (.not. strict) return
+    list = ""
+    do k = 1, size(unused)
+       if (k > 1) list = list // ", "
+       list = list // trim(unused(k))
+    end do
+    call msp_raise("unused arguments: " // list, stat, errmsg)
+  end subroutine args_finish
+
+!!! msp_info: scoped report views -------------------------------------------
+
+  subroutine info_open(this, root)
+    class(msp_info), intent(inout) :: this
+    type(msp_dict), intent(inout), target :: root
+
+    this%root => root
+    this%scope = ""
+  end subroutine info_open
+
+  !> View for a nested call: its results go below name.
+  subroutine info_enter(this, name, inner)
+    class(msp_info), intent(in) :: this
+    character(*), intent(in) :: name
+    type(msp_info), intent(out) :: inner
+
+    inner%root => this%root
+    inner%scope = join(this%scope, name)
+  end subroutine info_enter
+
+  !> Citations from nested views accumulate at the report root.
+  subroutine info_cite(this, key)
+    class(msp_info), intent(in) :: this
+    character(*), intent(in) :: key
+    integer :: pos
+
+    pos = this%root%find("citations")
+    if (pos < 0) then
+       call this%root%include("citations." // key)
+       return
+    end if
+    if (entry_type(this%root%e(pos)) /= MSP_DICTIONARY) then
+       call msp_raise("msp_info: citations must be a dictionary")
+    end if
+    select type (sub => this%root%e(pos)%v)
+    type is (msp_dict)
+       call sub%include(key)
+    end select
+  end subroutine info_cite
+
+#:for t in ALL
+  #:if t == 's'
+    #:set ty = 'character(*)'
+  #:else
+    #:set ty = TYPE[t]
+  #:endif
+  subroutine info_set_${t}$0(this, key, value)
+    class(msp_info), intent(in) :: this
+    character(*), intent(in) :: key
+    ${ty}$, intent(in) :: value
+
+    call this%root%set(join(this%scope, key), value)
+  end subroutine info_set_${t}$0
+
+  subroutine info_set_${t}$1(this, key, value)
+    class(msp_info), intent(in) :: this
+    character(*), intent(in) :: key
+    ${ty}$, dimension(:), intent(in) :: value
+
+    call this%root%set(join(this%scope, key), value)
+  end subroutine info_set_${t}$1
+
+  subroutine info_append_${t}$(this, key, value)
+    class(msp_info), intent(in) :: this
+    character(*), intent(in) :: key
+    ${ty}$, intent(in) :: value
+
+    call this%root%append(join(this%scope, key), value)
+  end subroutine info_append_${t}$
+
+#:endfor
+end module msp_dict_mod

@@ -1,0 +1,374 @@
+#! (suffix, value type, conversion from the complex reference)
+#:set KINDS = [('r', 'real(dp)', 'real(x, dp)'), ('c', 'complex(dp)', 'x')]
+!> Distributed matrix operations against dense references, for real and
+!> complex matrices in double and single precision, on square-as-possible
+!> and tall grids. Run on 1, 2 and 4 ranks. With the argument "device",
+!> every matrix is moved to the GPU after it is built (in the mixed tests,
+!> one operand stays on the host).
+program test_matrix
+  use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD, MPI_Allreduce, &
+       & MPI_IN_PLACE, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_Comm_size
+  use msp_kinds_mod, only: dp, i64
+  use msp_grid_mod, only: msp_grid
+  use msp_matrix_mod
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_allocations
+#:endif
+  use testing_mod, only: check, finish
+  implicit none
+
+  integer, parameter :: n = 13
+  type(msp_grid), target :: grid
+  integer :: nranks, shape, precision
+  logical :: device, single
+  !> Tolerance of the current precision, and its name for check labels.
+  real(dp) :: tol
+  character(:), allocatable :: tag
+  character(len=8) :: mode
+
+  call get_command_argument(1, mode)
+  device = mode == "device"
+  call msp_select_gpu()
+  call MPI_Init()
+  call MPI_Comm_size(MPI_COMM_WORLD, nranks)
+  do shape = 1, 2
+     if (shape == 1) then
+        call grid%init(MPI_COMM_WORLD)
+     else
+        call grid%init(MPI_COMM_WORLD, rows=nranks)
+     end if
+     do precision = 1, 2
+        single = precision == 2
+        tol = merge(1.0e-5_dp, 1.0e-12_dp, single)
+        tag = trim(merge("single ", "       ", single))
+#:for k, ty, conv in KINDS
+        call test_${k}$()
+#:endfor
+     end do
+  end do
+  single = .false.
+  tag = ""
+  call test_mixed()
+  call test_precision()
+  call test_errors()
+#:if defined('MSPOLY_GPU')
+  call check(msp_gpu_allocations() == 0, "every device allocation released")
+#:endif
+  call grid%free()
+  call finish("test_matrix")
+  call MPI_Finalize()
+
+contains
+
+  !> Dense n x n reference with about 30% nonzeros; the same on every rank.
+  function reference(seed, cplx) result(d)
+    integer, intent(in) :: seed
+    logical, intent(in) :: cplx
+    complex(dp), dimension(n, n) :: d
+    integer :: i, j, state
+
+    state = seed
+    d = 0
+    do j = 1, n
+       do i = 1, n
+          if (uniform(state) < 0.3_dp) then
+             d(i, j) = cmplx(2 * uniform(state) - 1, 0.0_dp, dp)
+             if (cplx) d(i, j)%im = 2 * uniform(state) - 1
+          end if
+       end do
+    end do
+  end function reference
+
+  real(dp) function uniform(state)
+    integer, intent(inout) :: state
+
+    state = int(mod(1103515245_i64 * state + 12345_i64, 2147483648_i64))
+    uniform = real(state, dp) / 2147483648.0_dp
+  end function uniform
+
+  !> Largest difference over all ranks between m and d, with entries below
+  !> threshold removed from d.
+  real(dp) function error(m, d, threshold) result(e)
+    type(msp_matrix), intent(in) :: m
+    complex(dp), dimension(:, :), intent(in) :: d
+    real(dp), intent(in), optional :: threshold
+    complex(dp), dimension(:, :), allocatable :: block, expected
+    integer, dimension(:), allocatable :: i, j
+    complex(dp), dimension(:), allocatable :: v
+    integer :: k
+
+    allocate(block(m%rows, m%cols))
+    block = 0
+    call m%entries(i, j, v)
+    do k = 1, size(i)
+       block(i(k) - m%row0, j(k) - m%col0) = v(k)
+    end do
+    expected = d(m%row0 + 1:m%row0 + m%rows, m%col0 + 1:m%col0 + m%cols)
+    if (present(threshold)) then
+       where (abs(expected) < threshold) expected = 0
+    end if
+    e = 0
+    if (size(block) > 0) e = maxval(abs(block - expected))
+    call MPI_Allreduce(MPI_IN_PLACE, e, 1, MPI_DOUBLE_PRECISION, MPI_MAX, &
+         & MPI_COMM_WORLD)
+  end function error
+
+#:for k, ty, conv in KINDS
+  !> Fill m from d. Each rank contributes every nranks-th entry; the first
+  !> nonzero is split into two halves from different ranks.
+  subroutine make_${k}$(m, d)
+    type(msp_matrix), intent(inout) :: m
+    complex(dp), dimension(n, n), intent(in) :: d
+    integer, dimension(n * n + 1) :: i, j
+    ${ty}$, dimension(n * n + 1) :: v
+    integer :: p, q, count, mine
+    complex(dp) :: x
+
+    call m%init(grid, n)
+    count = 0
+    mine = 0
+    do q = 1, n
+       do p = 1, n
+          if (d(p, q) == 0) cycle
+          count = count + 1
+          if (mod(count, nranks) /= grid%rank) cycle
+          x = d(p, q)
+          if (count == 1) x = x / 2
+          mine = mine + 1
+          i(mine) = p
+          j(mine) = q
+          v(mine) = ${conv}$
+       end do
+    end do
+    if (grid%rank == nranks - 1) then
+       first: do q = 1, n
+          do p = 1, n
+             if (d(p, q) == 0) cycle
+             x = d(p, q) / 2
+             mine = mine + 1
+             i(mine) = p
+             j(mine) = q
+             v(mine) = ${conv}$
+             exit first
+          end do
+       end do first
+    end if
+    call m%fill(i(1:mine), j(1:mine), v(1:mine))
+    if (single) call msp_to_single(m)
+    if (device) call msp_to_device(m)
+  end subroutine make_${k}$
+
+  subroutine test_${k}$()
+    type(msp_matrix) :: a, b, c, t, id
+    complex(dp), dimension(n, n) :: da, db, dc
+    complex(dp) :: zc
+    real(dp) :: zr
+    logical :: cplx
+
+    cplx = ${'.true.' if k == 'c' else '.false.'}$
+    da = reference(11, cplx)
+    db = reference(23, cplx)
+    dc = reference(37, cplx)
+    call make_${k}$(a, da)
+    call check(error(a, da) < tol .and. a%nnz() == count(da /= 0), &
+         & tag // "${k}$: fill from all ranks with duplicates")
+    call check(a%is_complex() .eqv. cplx, &
+         & tag // "${k}$: kind follows the values")
+    call check(a%on_device() .eqv. device, tag // "${k}$: location")
+    call check(a%is_single() .eqv. single, tag // "${k}$: precision")
+
+    call copy(b, a)
+    call msp_scale(b, 2.0_dp)
+    call check(error(a, da) < tol .and. error(b, 2 * da) < tol, &
+         & tag // "${k}$: copy is deep; real scale")
+    call msp_swap(a, b)
+    call check(error(a, 2 * da) < tol .and. error(b, da) < tol, &
+         & tag // "${k}$: swap")
+    call msp_swap(a, b)
+    call msp_scale(b, (0.0_dp, 0.5_dp))
+    call check(b%is_complex() .and. error(b, (0.0_dp, 1.0_dp) * da) < tol, &
+         & tag // "${k}$: complex scale")
+
+    call make_${k}$(b, db)
+    call msp_add(b, a, alpha=-0.5_dp)
+    call check(error(b, db - 0.5_dp * da) < tol, tag // "${k}$: add")
+    call make_${k}$(b, db)
+    call msp_add(b, a, threshold=0.4_dp)
+    call check(error(b, db + da, threshold=0.4_dp) < tol, &
+         & tag // "${k}$: add with threshold")
+
+    call msp_trace(a, zc)
+    call msp_trace(a, zr)
+    call check(abs(zc - trace(da)) < tol .and. &
+         & abs(zr - real(trace(da), dp)) < tol, &
+         & tag // "${k}$: trace")
+    call make_${k}$(b, db)
+    call msp_dot(a, b, zc)
+    call msp_dot(a, b, zr)
+    call check(abs(zc - sum(conjg(da) * db)) < tol .and. &
+         & abs(zr - real(sum(conjg(da) * db), dp)) < tol, tag // "${k}$: dot")
+    call check(abs(msp_norm(a) - sqrt(sum(abs(da)**2))) < tol, &
+         & tag // "${k}$: Frobenius norm")
+
+    call msp_transpose(a, t)
+    call check(error(t, transpose(da)) < tol, tag // "${k}$: transpose")
+    call msp_transpose(a, t, conjugate=.true.)
+    call check(error(t, conjg(transpose(da))) < tol, &
+         & tag // "${k}$: conjugate transpose")
+
+    call msp_multiply(a, b, c, alpha=1.5_dp)
+    call check(error(c, 1.5_dp * matmul(da, db)) < tol, &
+         & tag // "${k}$: multiply")
+    call make_${k}$(c, dc)
+    call msp_multiply(a, b, c, alpha=-1.0_dp, beta=2.0_dp)
+    call check(error(c, 2 * dc - matmul(da, db)) < tol, &
+         & tag // "${k}$: multiply and accumulate")
+    call make_${k}$(c, dc)
+    call msp_multiply(a, b, c, beta=1.0_dp, threshold=0.5_dp)
+    call check(error(c, dc + matmul(da, db), threshold=0.5_dp) < tol, &
+         & tag // "${k}$: multiply with threshold")
+
+    call id%init(grid, n)
+    call id%identity()
+    call msp_multiply(id, a, c)
+    call msp_trace(id, zr)
+    call check(error(c, da) < tol .and. abs(zr - n) < tol, &
+         & tag // "${k}$: identity")
+
+    call bad_fill_${k}$(c)
+    call a%free()
+    call b%free()
+    call c%free()
+    call t%free()
+    call id%free()
+  end subroutine test_${k}$
+
+  !> A bad index on one rank, or triplets of different lengths, fail on
+  !> every rank.
+  subroutine bad_fill_${k}$(m)
+    type(msp_matrix), intent(inout) :: m
+    integer, dimension(1) :: i, j
+    ${ty}$, dimension(1) :: v
+    integer :: stat
+    character(:), allocatable :: msg
+
+    i = 1
+    j = 1
+    v = 1
+    if (grid%rank == grid%size - 1) j = n + 1
+    call m%fill(i, j, v, stat, msg)
+    call check(stat /= 0 .and. index(msg, "out of range") > 0, &
+         & tag // "${k}$: an index out of range on one rank fails on " // &
+         & "every rank")
+    call m%fill(i, j(1:0), v, stat, msg)
+    call check(stat /= 0 .and. index(msg, "equally long") > 0, &
+         & tag // "${k}$: triplet arrays of different lengths")
+  end subroutine bad_fill_${k}$
+
+#:endfor
+  complex(dp) function trace(d) result(t)
+    complex(dp), dimension(n, n), intent(in) :: d
+    integer :: i
+
+    t = sum([(d(i, i), i = 1, n)])
+  end function trace
+
+  !> Operations on one real and one complex matrix work in complex.
+  subroutine test_mixed()
+    type(msp_matrix) :: a, b, c
+    complex(dp), dimension(n, n) :: da, db
+    complex(dp) :: zc
+
+    call grid%init(MPI_COMM_WORLD)
+    da = reference(11, .false.)
+    db = reference(23, .true.)
+    call make_r(a, da)
+    call make_c(b, db)
+    call msp_to_host(b)
+    call msp_multiply(a, b, c)
+    call check(c%is_complex() .and. error(c, matmul(da, db)) < tol, &
+         & "mixed: real times complex")
+    call msp_multiply(b, a, c)
+    call check(error(c, matmul(db, da)) < tol, "mixed: complex times real")
+    call msp_dot(a, b, zc)
+    call check(abs(zc - sum(conjg(da) * db)) < tol, "mixed: dot")
+    call msp_dot(b, a, zc)
+    call check(abs(zc - sum(conjg(db) * da)) < tol, "mixed: dot reversed")
+    call make_r(c, da)
+    call msp_to_host(c)
+    call msp_add(c, b)
+    call check(c%is_complex() .and. error(c, da + db) < tol, &
+         & "mixed: complex added to real")
+    call make_c(c, db)
+    call msp_add(c, a)
+    call check(error(c, da + db) < tol, "mixed: real added to complex")
+    call a%free()
+    call b%free()
+    call c%free()
+  end subroutine test_mixed
+
+  !> Single and double precision operands work in double; single
+  !> precision operands alone stay single.
+  subroutine test_precision()
+    type(msp_matrix) :: a, b, c
+    complex(dp), dimension(n, n) :: da, db
+
+    da = reference(11, .false.)
+    db = reference(23, .false.)
+    call make_r(a, da)
+    call make_r(b, db)
+    call msp_to_single(a)
+    call msp_multiply(a, b, c)
+    call check(.not. c%is_single() .and. &
+         & error(c, matmul(da, db)) < 1.0e-5_dp, &
+         & "precision: single times double is double")
+    call msp_multiply(a, a, c)
+    call check(c%is_single() .and. error(c, matmul(da, da)) < 1.0e-5_dp, &
+         & "precision: single times single is single")
+    call msp_transpose(a, c)
+    call check(c%is_single() .and. error(c, transpose(da)) < 1.0e-5_dp, &
+         & "precision: transpose keeps single precision")
+    call msp_add(b, a)
+    call check(.not. b%is_single() .and. error(b, da + db) < 1.0e-5_dp, &
+         & "precision: double plus single is double")
+    call msp_add(a, b)
+    call msp_to_single(b)
+    call msp_to_double(b)
+    call check(.not. a%is_single() .and. .not. b%is_single() .and. &
+         & error(a, 2 * da + db) < 1.0e-5_dp, &
+         & "precision: single plus double is double; back to double")
+    call a%free()
+    call b%free()
+    call c%free()
+  end subroutine test_precision
+
+  subroutine test_errors()
+    type(msp_matrix) :: a, b, c
+    integer, dimension(:), allocatable :: i, j
+    real(dp), dimension(:), allocatable :: v
+    complex(dp) :: zc
+    integer :: stat
+    character(:), allocatable :: msg
+
+    call a%init(grid, n)
+    call a%init(grid, 0, stat=stat)
+    call check(stat /= 0, "zero dimension")
+    call b%init(grid, n + 1)
+    call msp_add(b, a, stat=stat, errmsg=msg)
+    call check(stat /= 0 .and. index(msg, "differ") > 0, "add: dimensions")
+    call msp_multiply(a, b, c, stat=stat)
+    call check(stat /= 0, "multiply: dimensions")
+    call c%init(grid, n)
+    call msp_multiply(a, a, b, beta=1.0_dp, stat=stat)
+    call check(stat /= 0, "multiply: dimension of the accumulated matrix")
+    call msp_dot(a, b, zc, stat)
+    call check(stat /= 0, "dot: dimensions")
+    call msp_scale(a, (0.0_dp, 1.0_dp))
+    call a%entries(i, j, v, stat, msg)
+    call check(stat /= 0 .and. index(msg, "complex") > 0, &
+         & "real entries of a complex matrix")
+    call a%free()
+    call b%free()
+    call c%free()
+  end subroutine test_errors
+end program test_matrix

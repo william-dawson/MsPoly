@@ -1,0 +1,719 @@
+#! (suffix, value type, MPI datatype)
+#:set KINDS = [('r', 'real(dp)', 'MPI_DOUBLE_PRECISION'), &
+               ('c', 'complex(dp)', 'MPI_DOUBLE_COMPLEX')]
+!> Square matrices distributed over a 2D process grid.
+!>
+!> Grid row r owns a contiguous band of rows and grid column c a band of
+!> columns; the rank at (r, c) stores the piece where they meet. Bands differ
+!> in size by at most one, so no padding is needed. Values are real or
+!> complex, in double or single precision, stored on the host or on a GPU.
+!> An operation works in complex if any operand is complex, in single
+!> precision only if every operand is single, and on the GPU if any operand
+!> is there. Arithmetic is always in double precision: single precision
+!> values are rounded once when stored.
+module msp_matrix_mod
+  use mpi_f08, only: MPI_INTEGER, MPI_INTEGER8, MPI_DOUBLE_PRECISION, &
+       & MPI_DOUBLE_COMPLEX, MPI_SUM, MPI_IN_PLACE, MPI_Allreduce, &
+       & MPI_Alltoall, MPI_Alltoallv, MPI_Wtime
+  use, intrinsic :: iso_fortran_env, only: error_unit
+  use msp_kinds_mod, only: dp, i64
+  use msp_error_mod, only: msp_raise, msp_clear
+  use msp_dict_mod, only: msp_dict, copy
+  use msp_grid_mod, only: msp_grid
+  use msp_storage_mod, only: msp_storage, msp_free
+  use msp_csr_mod, only: msp_csr_r, msp_csr_c
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_csr_r, msp_gpu_csr_c, msp_gpu_csr_rs, &
+       & msp_gpu_csr_cs, msp_gpu_select, msp_upload, msp_download, &
+       & msp_host_copy
+#:endif
+  implicit none
+  private
+
+  public :: msp_matrix, copy, msp_swap, msp_scale, msp_add, msp_multiply, &
+       & msp_trace, msp_dot, msp_norm, msp_transpose, msp_to_device, &
+       & msp_to_host, msp_to_single, msp_to_double, msp_select_gpu
+
+  !> An n x n matrix on grid. The local piece covers global rows
+  !> row0 + 1 .. row0 + rows and columns col0 + 1 .. col0 + cols.
+  !> Matrices cannot be assigned; use copy(dst, src). Release a matrix with
+  !> free when done: a GPU matrix holds device memory.
+  type :: msp_matrix
+     type(msp_grid), pointer :: grid => null()
+     integer :: n = 0
+     integer :: row0 = 0
+     integer :: rows = 0
+     integer :: col0 = 0
+     integer :: cols = 0
+     class(msp_storage), allocatable :: local
+   contains
+     procedure :: init
+     procedure :: free
+     procedure :: identity
+     procedure :: is_complex
+     procedure :: is_single
+     procedure :: on_device
+     procedure :: nnz
+#:for k, ty, mpit in KINDS
+     generic :: fill => fill_${k}$
+     generic :: entries => entries_${k}$
+     procedure, private :: fill_${k}$, entries_${k}$
+#:endfor
+     generic :: assignment(=) => no_copy
+     procedure, private :: no_copy
+  end type msp_matrix
+
+  !> Deep copy of a matrix.
+  interface copy
+     module procedure copy_matrix
+  end interface copy
+
+  !> A = alpha * A, for real or complex alpha.
+  interface msp_scale
+     module procedure scale_r, scale_c
+  end interface msp_scale
+
+  !> Trace into a real (the real part) or complex result. Collective.
+  interface msp_trace
+     module procedure trace_r, trace_c
+  end interface msp_trace
+
+  !> Sum of conjg(A) * B over all entries, into a real (the real part) or
+  !> complex result. Collective.
+  interface msp_dot
+     module procedure dot_r, dot_c
+  end interface msp_dot
+
+contains
+
+  !> Bind this process to a GPU of its node before MPI_Init, from the local
+  !> rank the launcher sets, so that MPI starts with a CUDA context and can
+  !> choose its GPU transports. Without GPU support, or outside such a
+  !> launcher, it does nothing; the GPU is then bound when first used.
+  subroutine msp_select_gpu()
+#:if defined('MSPOLY_GPU')
+    call msp_gpu_select()
+#:endif
+  end subroutine msp_select_gpu
+
+!!! Construction --------------------------------------------------------------
+
+  !> Make this the n x n zero matrix (real) on grid.
+  subroutine init(this, grid, n, stat, errmsg)
+    class(msp_matrix), intent(inout) :: this
+    type(msp_grid), intent(in), target :: grid
+    integer, intent(in) :: n
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    integer, dimension(:), allocatable :: none
+    real(dp), dimension(:), allocatable :: zero
+
+    call msp_clear(stat)
+    if (n < 1) then
+       call msp_raise("msp_matrix: dimension must be positive", stat, errmsg)
+       return
+    end if
+    this%grid => grid
+    this%n = n
+    call band(n, grid%rows, grid%row, this%row0, this%rows)
+    call band(n, grid%cols, grid%col, this%col0, this%cols)
+    allocate(none(0), zero(0))
+    call set_local_r(this, none, none, zero)
+  end subroutine init
+
+  !> Release the storage. The matrix can be initialized again.
+  subroutine free(this)
+    class(msp_matrix), intent(inout) :: this
+
+    call msp_free(this%local)
+    this%grid => null()
+    this%n = 0
+  end subroutine free
+
+  !> Global offset and size of band k (0-based) when n is split into parts.
+  subroutine band(n, parts, k, offset, size)
+    integer, intent(in) :: n, parts, k
+    integer, intent(out) :: offset, size
+
+    offset = int(int(k, i64) * n / parts)
+    size = int(int(k + 1, i64) * n / parts) - offset
+  end subroutine band
+
+  !> Band (0-based) holding global index i (1-based).
+  pure integer function band_of(i, n, parts) result(k)
+    integer, intent(in) :: i, n, parts
+
+    k = int((int(i, i64) * parts - 1) / n)
+  end function band_of
+
+  !> Set to the identity.
+  subroutine identity(this)
+    class(msp_matrix), intent(inout) :: this
+    integer, dimension(:), allocatable :: d
+    real(dp), dimension(:), allocatable :: ones
+    integer :: g, first, last
+
+    first = max(this%row0, this%col0) + 1
+    last = min(this%row0 + this%rows, this%col0 + this%cols)
+    allocate(d(max(last - first + 1, 0)), ones(max(last - first + 1, 0)))
+    d = [(g, g = first, last)]
+    ones = 1
+    call set_local_r(this, d - this%row0, d - this%col0, ones)
+  end subroutine identity
+
+  logical function is_complex(this)
+    class(msp_matrix), intent(in) :: this
+
+    is_complex = this%local%is_complex()
+  end function is_complex
+
+  logical function is_single(this)
+    class(msp_matrix), intent(in) :: this
+
+    is_single = this%local%is_single()
+  end function is_single
+
+  logical function on_device(this)
+    class(msp_matrix), intent(in) :: this
+
+    on_device = .false.
+#:if defined('MSPOLY_GPU')
+    select type (s => this%local)
+    class is (msp_gpu_csr_r)
+       on_device = .true.
+    class is (msp_gpu_csr_c)
+       on_device = .true.
+    class is (msp_gpu_csr_rs)
+       on_device = .true.
+    class is (msp_gpu_csr_cs)
+       on_device = .true.
+    end select
+#:else
+    if (this%n < 0) on_device = .true.
+#:endif
+  end function on_device
+
+  !> Store the matrix on a GPU (one per rank, assigned within each node).
+  subroutine msp_to_device(a)
+    type(msp_matrix), intent(inout) :: a
+
+#:if defined('MSPOLY_GPU')
+    call msp_upload(a%local, a%grid%comm)
+#:else
+    if (a%n >= 0) call msp_raise("msp_matrix: built without GPU support")
+#:endif
+  end subroutine msp_to_device
+
+  !> Store the values in single precision; arithmetic stays in double.
+  subroutine msp_to_single(a)
+    type(msp_matrix), intent(inout) :: a
+
+    call convert(a, a%is_complex(), .true.)
+  end subroutine msp_to_single
+
+  !> Store the values in double precision.
+  subroutine msp_to_double(a)
+    type(msp_matrix), intent(inout) :: a
+
+    call convert(a, a%is_complex(), .false.)
+  end subroutine msp_to_double
+
+  !> Store the matrix on the host.
+  subroutine msp_to_host(a)
+    type(msp_matrix), intent(inout) :: a
+
+#:if defined('MSPOLY_GPU')
+    call msp_download(a%local)
+#:else
+    if (a%n < 0) call msp_raise("msp_matrix: invalid matrix")
+#:endif
+  end subroutine msp_to_host
+
+  !> Number of stored entries over all ranks. Collective.
+  integer(i64) function nnz(this)
+    class(msp_matrix), intent(in) :: this
+
+    nnz = this%local%nnz()
+    call MPI_Allreduce(MPI_IN_PLACE, nnz, 1, MPI_INTEGER8, MPI_SUM, &
+         & this%grid%comm)
+  end function nnz
+
+#:for k, ty, mpit in KINDS
+  !> Replace the local piece with one built from local triplets.
+  subroutine set_local_${k}$(this, i, j, v)
+    class(msp_matrix), intent(inout) :: this
+    integer, dimension(:), intent(in) :: i, j
+    ${ty}$, dimension(:), intent(in) :: v
+
+    call msp_free(this%local)
+    allocate(msp_csr_${k}$ :: this%local)
+    select type (s => this%local)
+    type is (msp_csr_${k}$)
+       call s%build(this%rows, this%cols, i, j, v)
+    end select
+  end subroutine set_local_${k}$
+
+  !> Replace the matrix with the entries (i, j, v) contributed by all ranks
+  !> (collective). Any rank may pass any entries; duplicates are summed. The
+  !> matrix becomes ${'complex' if k == 'c' else 'real'}$.
+  subroutine fill_${k}$(this, i, j, v, stat, errmsg)
+    class(msp_matrix), intent(inout) :: this
+    integer, dimension(:), intent(in) :: i, j
+    ${ty}$, dimension(:), intent(in) :: v
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    type(msp_dict) :: err
+    integer, dimension(:), allocatable :: dest, order, send_n, recv_n, &
+         & send_at, recv_at, si, sj, ri, rj
+    ${ty}$, dimension(:), allocatable :: sv, rv
+    integer :: p, k, np
+
+    call msp_clear(stat)
+    if (size(i) /= size(j) .or. size(i) /= size(v)) then
+       call err%set("message", "msp_matrix: fill needs equally long i, j, v")
+    else if (any(i < 1 .or. i > this%n .or. j < 1 .or. j > this%n)) then
+       call err%set("message", "msp_matrix: fill index out of range")
+       call err%set("n", this%n)
+    end if
+    call this%grid%agree(err, stat, errmsg)
+    if (err%num_keys() > 0) return
+
+    np = this%grid%size
+    dest = [(band_of(i(k), this%n, this%grid%rows) * this%grid%cols + &
+         & band_of(j(k), this%n, this%grid%cols), k = 1, size(i))]
+    allocate(send_n(0:np - 1), recv_n(0:np - 1))
+    send_n = [(count(dest == p), p = 0, np - 1)]
+    call MPI_Alltoall(send_n, 1, MPI_INTEGER, recv_n, 1, MPI_INTEGER, &
+         & this%grid%comm)
+    send_at = [0, (sum(send_n(0:p - 1)), p = 1, np - 1)]
+    recv_at = [0, (sum(recv_n(0:p - 1)), p = 1, np - 1)]
+    !! Order the entries by destination rank (stable counting sort).
+    allocate(order(size(i)))
+    block
+      integer, dimension(0:np - 1) :: next
+      next = send_at
+      do k = 1, size(i)
+         next(dest(k)) = next(dest(k)) + 1
+         order(next(dest(k))) = k
+      end do
+    end block
+    si = i(order)
+    sj = j(order)
+    sv = v(order)
+    allocate(ri(sum(recv_n)), rj(sum(recv_n)), rv(sum(recv_n)))
+    call MPI_Alltoallv(si, send_n, send_at, MPI_INTEGER, ri, recv_n, &
+         & recv_at, MPI_INTEGER, this%grid%comm)
+    call MPI_Alltoallv(sj, send_n, send_at, MPI_INTEGER, rj, recv_n, &
+         & recv_at, MPI_INTEGER, this%grid%comm)
+    call MPI_Alltoallv(sv, send_n, send_at, ${mpit}$, rv, recv_n, recv_at, &
+         & ${mpit}$, this%grid%comm)
+    call set_local_${k}$(this, ri - this%row0, rj - this%col0, rv)
+  end subroutine fill_${k}$
+
+  !> Local entries with global indices.
+  #:if k == 'r'
+  !> Reading real values from a complex matrix is an error.
+  subroutine entries_${k}$(this, i, j, v, stat, errmsg)
+  #:else
+  subroutine entries_${k}$(this, i, j, v)
+  #:endif
+    class(msp_matrix), intent(in) :: this
+    integer, dimension(:), allocatable, intent(out) :: i, j
+    ${ty}$, dimension(:), allocatable, intent(out) :: v
+  #:if k == 'r'
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+  #:endif
+    class(msp_storage), allocatable :: host, wide
+
+  #:if k == 'r'
+    call msp_clear(stat)
+    if (this%is_complex()) then
+       call msp_raise("msp_matrix: the matrix is complex; read complex " // &
+            & "values", stat, errmsg)
+       return
+    end if
+  #:endif
+    !! Read a double precision host copy when the piece is neither.
+    if (this%is_single() .or. this%on_device()) then
+#:if defined('MSPOLY_GPU')
+       call msp_host_copy(this%local, host)
+#:endif
+       if (.not. allocated(host)) call this%local%copy_to(host)
+       call host%convert_to(wide, host%is_complex(), .false.)
+       call read_piece(wide)
+       call msp_free(host)
+       call msp_free(wide)
+    else
+       call read_piece(this%local)
+    end if
+    i = i + this%row0
+    j = j + this%col0
+
+  contains
+
+    subroutine read_piece(piece)
+      class(msp_storage), intent(in) :: piece
+      real(dp), dimension(:), allocatable :: vr
+
+      select type (piece)
+      class is (msp_csr_r)
+         call piece%entries(i, j, vr)
+         v = vr
+  #:if k == 'c'
+      class is (msp_csr_c)
+         call piece%entries(i, j, v)
+  #:endif
+      end select
+    end subroutine read_piece
+  end subroutine entries_${k}$
+
+#:endfor
+  subroutine copy_matrix(dst, src)
+    type(msp_matrix), intent(inout) :: dst
+    type(msp_matrix), intent(in) :: src
+
+    dst%grid => src%grid
+    dst%n = src%n
+    dst%row0 = src%row0
+    dst%rows = src%rows
+    dst%col0 = src%col0
+    dst%cols = src%cols
+    call src%local%copy_to(dst%local)
+  end subroutine copy_matrix
+
+  !> Exchange a and b without copying their pieces.
+  subroutine msp_swap(a, b)
+    type(msp_matrix), intent(inout) :: a, b
+    type(msp_grid), pointer :: grid
+    class(msp_storage), allocatable :: local
+    integer, dimension(5) :: shape
+
+    grid => a%grid
+    a%grid => b%grid
+    b%grid => grid
+    shape = [a%n, a%row0, a%rows, a%col0, a%cols]
+    a%n = b%n
+    a%row0 = b%row0
+    a%rows = b%rows
+    a%col0 = b%col0
+    a%cols = b%cols
+    b%n = shape(1)
+    b%row0 = shape(2)
+    b%rows = shape(3)
+    b%col0 = shape(4)
+    b%cols = shape(5)
+    call move_alloc(a%local, local)
+    call move_alloc(b%local, a%local)
+    call move_alloc(local, b%local)
+  end subroutine msp_swap
+
+  subroutine no_copy(lhs, rhs)
+    class(msp_matrix), intent(inout) :: lhs
+    class(msp_matrix), intent(in) :: rhs
+
+    if (lhs%n < 0 .or. rhs%n < 0) continue
+    error stop "msp_matrix: a matrix cannot be assigned; use copy(dst, src)"
+  end subroutine no_copy
+
+!!! Kinds and checks -----------------------------------------------------------
+
+  !> Store this matrix with complex (cplx) or real values in single or double
+  !> precision.
+  subroutine convert(this, cplx, single)
+    type(msp_matrix), intent(inout) :: this
+    logical, intent(in) :: cplx, single
+    class(msp_storage), allocatable :: converted
+
+    if ((this%is_complex() .eqv. cplx) .and. (this%is_single() .eqv. single)) &
+         & return
+    call this%local%convert_to(converted, cplx, single)
+    call msp_free(this%local)
+    call move_alloc(converted, this%local)
+  end subroutine convert
+
+  !> x becomes a copy of a's piece converted to complex (cplx), to the
+  !> precision given by single, and to the GPU (device) where a differs;
+  !> otherwise x is left unallocated and a's piece is used directly.
+  subroutine operand(a, cplx, single, device, x)
+    type(msp_matrix), intent(in) :: a
+    logical, intent(in) :: cplx, single, device
+    class(msp_storage), allocatable, intent(inout) :: x
+
+    call msp_free(x)
+    if ((cplx .neqv. a%is_complex()) .or. (single .neqv. a%is_single())) &
+         & call a%local%convert_to(x, cplx, single)
+#:if defined('MSPOLY_GPU')
+    if (device .and. .not. a%on_device()) then
+       if (.not. allocated(x)) call a%local%copy_to(x)
+       call msp_upload(x, a%grid%comm)
+    end if
+#:else
+    if (device) continue
+#:endif
+  end subroutine operand
+
+  !> Convert a in place to complex (cplx), to the precision given by single,
+  !> and to the GPU (device).
+  subroutine place(a, cplx, single, device)
+    type(msp_matrix), intent(inout) :: a
+    logical, intent(in) :: cplx, single, device
+
+    call convert(a, cplx, single)
+#:if defined('MSPOLY_GPU')
+    if (device .and. .not. a%on_device()) call msp_to_device(a)
+#:else
+    if (device) continue
+#:endif
+  end subroutine place
+
+  !> Raise unless a and b are on the same grid with the same dimension.
+  subroutine check_same(a, b, stat, errmsg)
+    type(msp_matrix), intent(in) :: a, b
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+
+    call msp_clear(stat)
+    if (.not. associated(a%grid, b%grid) .or. a%n /= b%n) &
+         & call msp_raise("msp_matrix: operands differ in grid or dimension", &
+         & stat, errmsg)
+  end subroutine check_same
+
+!!! Algebra --------------------------------------------------------------------
+
+  subroutine scale_r(a, alpha)
+    type(msp_matrix), intent(inout) :: a
+    real(dp), intent(in) :: alpha
+
+    call a%local%scale(cmplx(alpha, 0.0_dp, dp))
+  end subroutine scale_r
+
+  subroutine scale_c(a, alpha)
+    type(msp_matrix), intent(inout) :: a
+    complex(dp), intent(in) :: alpha
+
+    if (alpha%im /= 0) call convert(a, .true., a%is_single())
+    call a%local%scale(alpha)
+  end subroutine scale_c
+
+  !> B = alpha * A + B, dropping exact zeros and entries with
+  !> |value| < threshold.
+  subroutine msp_add(b, a, alpha, threshold, stat, errmsg)
+    type(msp_matrix), intent(inout) :: b
+    type(msp_matrix), intent(in) :: a
+    real(dp), intent(in), optional :: alpha, threshold
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    class(msp_storage), allocatable :: x
+    logical :: single
+
+    call check_same(a, b, stat, errmsg)
+    if (present(stat)) then
+       if (stat /= 0) return
+    end if
+    single = a%is_single() .and. b%is_single()
+    call place(b, a%is_complex() .or. b%is_complex(), single, &
+         & a%on_device() .or. b%on_device())
+    call operand(a, b%is_complex(), single, b%on_device(), x)
+    if (allocated(x)) then
+       call b%local%add(x, coefficient(alpha, 1.0_dp), &
+            & or_default(threshold, 0.0_dp))
+    else
+       call b%local%add(a%local, coefficient(alpha, 1.0_dp), &
+            & or_default(threshold, 0.0_dp))
+    end if
+    call msp_free(x)
+  end subroutine msp_add
+
+  !> C = alpha * A * B + beta * C, dropping exact zeros and entries with
+  !> |value| < threshold (collective). C must be a different matrix from A
+  !> and B. With beta = 0 (the default) C need not be initialized.
+  subroutine msp_multiply(a, b, c, alpha, beta, threshold, stat, errmsg)
+    type(msp_matrix), intent(in), target :: a, b
+    type(msp_matrix), intent(inout) :: c
+    real(dp), intent(in), optional :: alpha, beta, threshold
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    class(msp_storage), allocatable, target :: xa, xb, a_band, b_band
+    class(msp_storage), pointer :: pa, pb
+    logical :: cplx, device, single
+    logical, save :: profile = .false., profile_checked = .false.
+    character(8) :: flag
+    real(dp) :: t0, t1, t2
+
+    call check_same(a, b, stat, errmsg)
+    if (present(stat)) then
+       if (stat /= 0) return
+    end if
+    single = a%is_single() .and. b%is_single()
+    if (or_default(beta, 0.0_dp) == 0) then
+       call c%init(a%grid, a%n)
+    else
+       single = single .and. c%is_single()
+       call check_same(a, c, stat, errmsg)
+       if (present(stat)) then
+          if (stat /= 0) return
+       end if
+    end if
+    cplx = a%is_complex() .or. b%is_complex() .or. c%is_complex()
+    device = a%on_device() .or. b%on_device() .or. c%on_device()
+    call place(c, cplx, single, device)
+    if (.not. profile_checked) then
+       call get_environment_variable("MSPOLY_PROFILE", flag)
+       profile = trim(flag) == "1"
+       profile_checked = .true.
+    end if
+    if (profile) t0 = MPI_Wtime()
+    !! pa and pb point at the operand pieces (converted if needed), then at
+    !! their bands; a grid row or column of one rank is its own band.
+    call operand(a, cplx, single, device, xa)
+    pa => a%local
+    if (allocated(xa)) pa => xa
+    if (a%grid%cols > 1) then
+       call pa%gather_rows(a%grid%row_comm, a_band)
+       pa => a_band
+    end if
+    call operand(b, cplx, single, device, xb)
+    pb => b%local
+    if (allocated(xb)) pb => xb
+    if (b%grid%rows > 1) then
+       call pb%gather_cols(b%grid%col_comm, b_band)
+       pb => b_band
+    end if
+    if (profile) t1 = MPI_Wtime()
+    call c%local%multiply(pa, pb, coefficient(alpha, 1.0_dp), &
+         & coefficient(beta, 0.0_dp), or_default(threshold, 0.0_dp))
+    if (profile) then
+       t2 = MPI_Wtime()
+       write(error_unit, '(A,I0,A,I0,A,I0,A,2(1X,F10.4),2(1X,I0))') &
+            & "[msp-prof] grid ", a%grid%rows, "x", a%grid%cols, &
+            & " rank ", a%grid%rank, " gather_s multiply_s nnz_ab ", &
+            & t1 - t0, t2 - t1, pa%nnz(), pb%nnz()
+    end if
+    call msp_free(xa)
+    call msp_free(xb)
+    call msp_free(a_band)
+    call msp_free(b_band)
+  end subroutine msp_multiply
+
+  subroutine trace_r(a, t)
+    type(msp_matrix), intent(in) :: a
+    real(dp), intent(out) :: t
+    complex(dp) :: tc
+
+    call trace_c(a, tc)
+    t = tc%re
+  end subroutine trace_r
+
+  subroutine trace_c(a, t)
+    type(msp_matrix), intent(in) :: a
+    complex(dp), intent(out) :: t
+
+    t = a%local%trace(a%row0, a%col0)
+    call MPI_Allreduce(MPI_IN_PLACE, t, 1, MPI_DOUBLE_COMPLEX, MPI_SUM, &
+         & a%grid%comm)
+  end subroutine trace_c
+
+  subroutine dot_r(a, b, d, stat, errmsg)
+    type(msp_matrix), intent(in) :: a, b
+    real(dp), intent(out) :: d
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    complex(dp) :: dc
+
+    call dot_c(a, b, dc, stat, errmsg)
+    d = dc%re
+  end subroutine dot_r
+
+  subroutine dot_c(a, b, d, stat, errmsg)
+    type(msp_matrix), intent(in) :: a, b
+    complex(dp), intent(out) :: d
+    integer, intent(out), optional :: stat
+    character(:), allocatable, intent(out), optional :: errmsg
+    class(msp_storage), allocatable :: xa, xb
+    logical :: cplx, single, device
+
+    d = 0
+    call check_same(a, b, stat, errmsg)
+    if (present(stat)) then
+       if (stat /= 0) return
+    end if
+    cplx = a%is_complex() .or. b%is_complex()
+    single = a%is_single() .and. b%is_single()
+    device = a%on_device() .or. b%on_device()
+    call operand(a, cplx, single, device, xa)
+    call operand(b, cplx, single, device, xb)
+#:if defined('MSPOLY_GPU')
+    if (allocated(xa) .and. allocated(xb)) then
+       d = xa%dot(xb)
+       call MPI_Allreduce(MPI_IN_PLACE, d, 1, MPI_DOUBLE_COMPLEX, MPI_SUM, &
+            & a%grid%comm)
+       call msp_free(xa)
+       call msp_free(xb)
+       return
+    end if
+#:endif
+    if (allocated(xa)) then
+       d = xa%dot(b%local)
+    else if (allocated(xb)) then
+       d = a%local%dot(xb)
+    else
+       d = a%local%dot(b%local)
+    end if
+    call msp_free(xa)
+    call msp_free(xb)
+    call MPI_Allreduce(MPI_IN_PLACE, d, 1, MPI_DOUBLE_COMPLEX, MPI_SUM, &
+         & a%grid%comm)
+  end subroutine dot_c
+
+  !> Frobenius norm. Collective.
+  real(dp) function msp_norm(a) result(norm)
+    type(msp_matrix), intent(in) :: a
+
+    norm = a%local%norm2()
+    call MPI_Allreduce(MPI_IN_PLACE, norm, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+         & a%grid%comm)
+    norm = sqrt(norm)
+  end function msp_norm
+
+  !> AT = transpose(A), or its conjugate transpose with conjugate=.true.
+  !> (collective). AT must be a different matrix from A.
+  subroutine msp_transpose(a, at, conjugate)
+    type(msp_matrix), intent(in) :: a
+    type(msp_matrix), intent(inout) :: at
+    logical, intent(in), optional :: conjugate
+    integer, dimension(:), allocatable :: i, j
+    real(dp), dimension(:), allocatable :: vr
+    complex(dp), dimension(:), allocatable :: vc
+
+    call at%init(a%grid, a%n)
+    if (a%is_complex()) then
+       call a%entries(i, j, vc)
+       if (present(conjugate)) then
+          if (conjugate) vc = conjg(vc)
+       end if
+       call at%fill(j, i, vc)
+    else
+       call a%entries(i, j, vr)
+       call at%fill(j, i, vr)
+    end if
+    if (a%is_single()) call msp_to_single(at)
+    if (a%on_device()) call msp_to_device(at)
+  end subroutine msp_transpose
+
+  complex(dp) function coefficient(x, default) result(c)
+    real(dp), intent(in), optional :: x
+    real(dp), intent(in) :: default
+
+    c = default
+    if (present(x)) c = x
+  end function coefficient
+
+  real(dp) function or_default(x, default) result(v)
+    real(dp), intent(in), optional :: x
+    real(dp), intent(in) :: default
+
+    v = default
+    if (present(x)) v = x
+  end function or_default
+end module msp_matrix_mod

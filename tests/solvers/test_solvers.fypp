@@ -1,0 +1,407 @@
+#! (suffix, value type, logical complex)
+#:set KINDS = [('r', 'real(dp)', '.false.'), ('c', 'complex(dp)', '.true.')]
+!> Solvers on matrices U D U^H, with U a Householder reflector and D a
+!> known spectrum, against exact results: spectral bounds, square roots,
+!> density matrices by every method, with and without an overlap, at
+!> finite temperature, and their extrapolation to a new overlap. Real
+!> and complex; run on 1, 2 and 4 ranks. With the argument "device", inputs
+!> are moved to the GPU. With the argument "method", an unknown method must
+!> stop the program.
+program test_solvers
+  use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD
+  use msp_kinds_mod, only: dp
+  use msp_dict_mod, only: msp_dict
+  use msp_grid_mod, only: msp_grid
+  use msp_matrix_mod
+  use msp_bounds_mod, only: msp_bounds
+  use msp_sqrt_mod, only: msp_sqrt, msp_inverse_sqrt
+  use msp_density_mod, only: msp_density, msp_energy_density, msp_mcweeny
+  use msp_fermi_mod, only: msp_fermi
+  use msp_extrapolate_mod, only: msp_purification_extrapolate, &
+       & msp_lowdin_extrapolate
+  use msp_analysis_mod, only: msp_reduce_dimension
+  use spectral_mod, only: spectrum, distribute, deviation
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_allocations
+#:endif
+  use testing_mod, only: check, finish
+  implicit none
+
+  !> H has eigenvalues -6, ..., 6, the lowest `occupied` filled; the
+  !> overlap S has eigenvalues 1, ..., 13.
+  integer, parameter :: n = 13, occupied = 6
+  type(msp_grid), target :: grid
+  type(msp_matrix) :: h, k
+  type(msp_dict) :: args, info
+  logical :: device
+  character(len=8) :: mode
+
+  call get_command_argument(1, mode)
+  device = mode == "device"
+  call msp_select_gpu()
+  call MPI_Init()
+  call grid%init(MPI_COMM_WORLD)
+  if (mode == "method") then
+     call args%set("trace", 1.0_dp)
+     call args%set("method", "trs3")
+     call msp_density(h, k, args, info)
+  end if
+#:for k, ty, cplx in KINDS
+  call test_${k}$()
+#:endfor
+#:if defined('MSPOLY_GPU')
+  call check(msp_gpu_allocations() == 0, "every device allocation released")
+#:endif
+  call grid%free()
+  call finish("test_solvers")
+  call MPI_Finalize()
+
+contains
+
+  !> Gershgorin bounds of a dense matrix.
+  subroutine gershgorin(h, emin, emax)
+    complex(dp), dimension(n, n), intent(in) :: h
+    real(dp), intent(out) :: emin, emax
+    real(dp), dimension(n) :: radius
+    integer :: i
+
+    radius = sum(abs(h), dim=2) - [(abs(h(i, i)), i = 1, n)]
+    emin = minval([(h(i, i)%re, i = 1, n)] - radius)
+    emax = maxval([(h(i, i)%re, i = 1, n)] + radius)
+  end subroutine gershgorin
+
+#:for k, ty, cplx in KINDS
+  subroutine test_${k}$()
+    type(msp_matrix) :: h, s, x, density
+    type(msp_dict) :: args, info
+    complex(dp), dimension(n, n) :: dh, dk, root, inverse
+    real(dp), dimension(n) :: d, occupation, overlap
+    real(dp) :: emin, emax, mu
+    real(dp), dimension(:), allocatable :: history, errors
+    character(:), dimension(:), allocatable :: unused
+    logical :: cplx
+    integer :: i
+
+    cplx = ${cplx}$
+    d = [(i - 7, i = 1, n)]
+    occupation = merge(1, 0, d < 0)
+    overlap = [(i, i = 1, n)]
+    dh = spectrum(d, cplx, 1.3_dp, 0.7_dp)
+    dk = spectrum(occupation, cplx, 1.3_dp, 0.7_dp)
+    root = spectrum(sqrt(overlap), cplx, 0.4_dp, 1.1_dp)
+    inverse = spectrum(1 / sqrt(overlap), cplx, 0.4_dp, 1.1_dp)
+    call distribute(h, dh, grid, ${cplx}$, device)
+    call distribute(s, spectrum(overlap, cplx, 0.4_dp, 1.1_dp), grid, &
+         & ${cplx}$, device)
+
+    call gershgorin(dh, emin, emax)
+    call msp_bounds(h, args, info)
+    call check(abs(info%get_real("min") - emin) < 1.0e-12_dp .and. &
+         & abs(info%get_real("max") - emax) < 1.0e-12_dp, &
+         & "${k}$: Gershgorin bounds")
+
+    !! Square roots.
+    call args%set("tolerance", 1.0e-12_dp)
+    call info%clear()
+    call msp_sqrt(s, x, args, info)
+    call check(deviation(x, root) < 1.0e-9_dp .and. &
+         & info%get_string("stop") == "tolerance", "${k}$: square root")
+    call info%clear()
+    call msp_inverse_sqrt(s, x, args, info)
+    call check(deviation(x, inverse) < 1.0e-9_dp, "${k}$: inverse square root")
+    call args%set("bounds.method", "power")
+    call info%clear()
+    call msp_inverse_sqrt(s, x, args, info)
+    call check(deviation(x, inverse) < 1.0e-9_dp .and. &
+         & info%get_real("bounds.largest") > 0.0_dp, &
+         & "${k}$: inverse square root with power bounds")
+    call args%set("tolerance", -1.0_dp)
+    call info%clear()
+    call msp_inverse_sqrt(s, x, args, info)
+    call check(deviation(x, inverse) < 1.0e-9_dp .and. &
+         & info%get_string("stop") == "stagnation", &
+         & "${k}$: square root stops when the residual stalls")
+    call args%set("max_iterations", 1)
+    call info%clear()
+    call msp_inverse_sqrt(s, x, args, info)
+    call check(.not. info%get_logical("converged"), &
+         & "${k}$: square root non-convergence reported")
+    call args%clear()
+
+    call test_methods_${k}$(h, cplx)
+    call test_reduce_${k}$(h)
+    call test_helpers_${k}$(h, s, dh, dk, root, cplx)
+    call test_fermi_${k}$(h, s, d, root, inverse, cplx)
+    call test_extrapolation_${k}$(s, dk, overlap, inverse, cplx)
+
+    !! Density matrices in an orthogonal basis.
+    call args%set("trace", real(occupied, dp))
+    call args%set("tolerance", 1.0e-13_dp)
+    call args%set("treshold", 1.0e-6_dp)
+    call info%clear()
+    call msp_density(h, density, args, info)
+    call info%get("energy_history", history)
+    call info%get("unused_arguments", unused)
+    mu = info%get_real("chemical_potential")
+    call check(deviation(density, dk) < 1.0e-9_dp, "${k}$: exact projector")
+    call check(info%get_logical("converged") .and. &
+         & info%get_string("stop") == "tolerance" .and. &
+         & size(history) == info%get_int("iterations"), &
+         & "${k}$: converged at the tolerance, one energy per iteration")
+    call check(abs(info%get_real("energy") + 21) < 1.0e-9_dp, &
+         & "${k}$: energy is the sum of the occupied eigenvalues")
+    call check(mu > -1 .and. mu < 0, "${k}$: chemical potential in the gap")
+    call check(abs(info%get_real("bounds.min") - emin) < 1.0e-12_dp, &
+         & "${k}$: bounds reported")
+    call check(size(unused) == 1 .and. unused(1) == "treshold", &
+         & "${k}$: misspelt key reported")
+
+    !! With an overlap S: H' = S^(1/2) H S^(1/2) has the generalized
+    !! eigenvalues of H, and the density matrix S^(-1/2) P S^(-1/2).
+    call distribute(x, matmul(root, matmul(dh, root)), grid, ${cplx}$, &
+         & device)
+    call info%clear()
+    call msp_density(x, density, args, info, overlap=s)
+    call check(deviation(density, matmul(inverse, matmul(dk, inverse))) &
+         & < 1.0e-8_dp .and. abs(info%get_real("energy") + 21) < 1.0e-8_dp &
+         & .and. info%get_logical("inverse_sqrt.converged"), &
+         & "${k}$: density matrix with an overlap")
+
+    call args%set("threshold", 1.0e-3_dp)
+    call args%set("tolerance", -1.0_dp)
+    call info%clear()
+    call msp_density(h, density, args, info)
+    call info%get("energy_history", history)
+    call info%get("idempotency_history", errors)
+    call check(info%get_string("stop") == "stagnation" .and. &
+         & size(errors) == size(history) + 1 .and. &
+         & abs(info%get_real("energy") + 21) < 1.0e-2_dp, &
+         & "${k}$: stops when truncation stalls the idempotency error")
+
+    !! In single precision: H and every iterate are stored in single
+    !! precision, so the solver stops when rounding stalls it.
+    call args%set("threshold", 0.0_dp)
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_to_single(h)
+    call info%clear()
+    call msp_density(h, density, args, info)
+    call check(density%is_single() .and. deviation(density, dk) < 1.0e-5_dp &
+         & .and. abs(info%get_real("energy") + 21) < 1.0e-5_dp &
+         & .and. info%get_logical("converged"), &
+         & "${k}$: density matrix in single precision")
+    call msp_to_single(s)
+    call info%clear()
+    call msp_inverse_sqrt(s, x, args, info)
+    call check(x%is_single() .and. deviation(x, inverse) < 1.0e-5_dp, &
+         & "${k}$: inverse square root in single precision")
+    call msp_to_double(h)
+
+    call args%set("max_iterations", 2)
+    call info%clear()
+    call msp_density(h, density, args, info)
+    call check(.not. info%get_logical("converged") .and. &
+         & info%get_string("stop") == "max_iterations" .and. &
+         & info%get_int("iterations") == 2, &
+         & "${k}$: non-convergence reported")
+    call h%free()
+    call s%free()
+    call x%free()
+    call density%free()
+  end subroutine test_${k}$
+
+  !> Every method, with 1, 6 and 12 of the 13 states occupied: the exact
+  !> density matrix, the energy and the chemical potential in the gap.
+  subroutine test_methods_${k}$(h, cplx)
+    type(msp_matrix), intent(in) :: h
+    logical, intent(in) :: cplx
+    character(14), dimension(5), parameter :: methods = [character(14) :: &
+         & "trs2", "trs4", "pm", "hpcp", "scale_and_fold"]
+    integer, dimension(3), parameter :: fillings = [1, 6, 12]
+    type(msp_matrix) :: density
+    type(msp_dict) :: args, info
+    character(len=40) :: label
+    real(dp) :: mu, homo
+    integer :: m, f, i
+
+    do f = 1, size(fillings)
+       homo = fillings(f) - 7
+       do m = 1, size(methods)
+          call args%clear()
+          call args%set("trace", real(fillings(f), dp))
+          call args%set("method", trim(methods(m)))
+          call args%set("tolerance", 1.0e-13_dp)
+          call args%set("homo", homo)
+          call args%set("lumo", homo + 1)
+          call info%clear()
+          call msp_density(h, density, args, info)
+          mu = info%get_real("chemical_potential")
+          write (label, '(a, " with ", i0, " occupied")') trim(methods(m)), &
+               & fillings(f)
+          call check(deviation(density, spectrum(merge(1.0_dp, 0.0_dp, &
+               & [(i <= fillings(f), i = 1, n)]), cplx, 1.3_dp, 0.7_dp)) &
+               & < 1.0e-9_dp .and. abs(info%get_real("energy") - &
+               & sum([(i - 7, i = 1, fillings(f))])) < 1.0e-9_dp .and. &
+               & mu > homo .and. mu < homo + 1, "${k}$: " // trim(label))
+       end do
+    end do
+    call density%free()
+  end subroutine test_methods_${k}$
+
+  !> The energy-weighted density matrix D H D and McWeeny steps, with and
+  !> without an overlap, against dense formulas.
+  subroutine test_helpers_${k}$(h, s, dh, dk, root, cplx)
+    type(msp_matrix), intent(in) :: h, s
+    complex(dp), dimension(n, n), intent(in) :: dh, dk, root
+    logical, intent(in) :: cplx
+    type(msp_matrix) :: d, out
+    complex(dp), dimension(n, n) :: dd, ds
+    integer :: i
+
+    dd = 0.9_dp * dk + 0.05_dp * spectrum([(1.0_dp, i = 1, n)], cplx, &
+         & 0.4_dp, 1.1_dp)
+    call distribute(d, dd, grid, ${cplx}$, device)
+    call msp_energy_density(h, d, out)
+    call check(deviation(out, matmul(dd, matmul(dh, dd))) < 1.0e-9_dp, &
+         & "${k}$: energy-weighted density matrix")
+    call msp_mcweeny(d, out)
+    call check(deviation(out, 3 * matmul(dd, dd) - 2 * matmul(dd, matmul(dd, &
+         & dd))) < 1.0e-9_dp, "${k}$: McWeeny step")
+    ds = matmul(dd, matmul(root, root))
+    call msp_mcweeny(d, out, overlap=s)
+    call check(deviation(out, 3 * matmul(ds, dd) - 2 * matmul(ds, matmul(ds, &
+         & dd))) < 1.0e-9_dp, "${k}$: McWeeny step with an overlap")
+    call d%free()
+    call out%free()
+  end subroutine test_helpers_${k}$
+
+  !> H restricted to its 6 lowest eigenvectors: a 6 x 6 matrix whose trace
+  !> is the sum of those eigenvalues.
+  subroutine test_reduce_${k}$(h)
+    type(msp_matrix), intent(in) :: h
+    type(msp_matrix) :: r
+    type(msp_dict) :: args, info
+    real(dp) :: trace
+
+    call args%set("dim", 6)
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_reduce_dimension(h, r, args, info)
+    call msp_trace(r, trace)
+    call check(r%n == 6 .and. abs(trace + 21) < 1.0e-8_dp .and. &
+         & info%get_int("cholesky.rank") == 6, "${k}$: reduced dimension")
+    call r%free()
+  end subroutine test_reduce_${k}$
+
+  !> Fermi-Dirac density matrices: grand canonical and canonical, with an
+  !> overlap, and stopping early once W no longer changes.
+  subroutine test_fermi_${k}$(h, s, d, root, inverse, cplx)
+    type(msp_matrix), intent(in) :: h, s
+    real(dp), dimension(n), intent(in) :: d
+    complex(dp), dimension(n, n), intent(in) :: root, inverse
+    logical, intent(in) :: cplx
+    real(dp), parameter :: beta = 1
+    type(msp_matrix) :: k, hs
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: f
+    real(dp) :: mu, low, high
+    integer :: step
+
+    f = 1 / (1 + exp(beta * (d + 0.5_dp)))
+    call args%set("inverse_temperature", beta)
+    call args%set("chemical_potential", -0.5_dp)
+    call args%set("step_tolerance", 1.0e-5_dp)
+    call msp_fermi(h, k, args, info)
+    call check(deviation(k, spectrum(f, cplx, 1.3_dp, 0.7_dp)) < 1.0e-5_dp &
+         & .and. abs(info%get_real("energy") - sum(f * d)) < 1.0e-4_dp .and. &
+         & info%get_logical("converged"), "${k}$: Fermi-Dirac, grand canonical")
+
+    !! The chemical potential with 6 electrons, by bisection.
+    low = -6
+    high = 6
+    do step = 1, 60
+       mu = (low + high) / 2
+       if (sum(1 / (1 + exp(beta * (d - mu)))) > 6) then
+          high = mu
+       else
+          low = mu
+       end if
+    end do
+    f = 1 / (1 + exp(beta * (d - mu)))
+    call args%remove("chemical_potential")
+    call args%set("trace", 6.0_dp)
+    call msp_fermi(h, k, args, info)
+    call check(deviation(k, spectrum(f, cplx, 1.3_dp, 0.7_dp)) < 1.0e-5_dp, &
+         & "${k}$: Fermi-Dirac, canonical")
+
+    call distribute(hs, matmul(root, matmul(spectrum(d, cplx, 1.3_dp, &
+         & 0.7_dp), root)), grid, cplx, device)
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_fermi(hs, k, args, info, overlap=s)
+    call check(deviation(k, matmul(inverse, matmul(spectrum(f, cplx, &
+         & 1.3_dp, 0.7_dp), inverse))) < 1.0e-5_dp, &
+         & "${k}$: Fermi-Dirac with an overlap")
+
+    !! At zero temperature the density matrix is the projector; W stops
+    !! changing long before beta reaches 10^6.
+    call args%clear()
+    call args%set("inverse_temperature", 1.0e6_dp)
+    call args%set("chemical_potential", -0.5_dp)
+    call args%set("tolerance", 1.0e-4_dp)
+    call args%set("step_tolerance", 1.0e-5_dp)
+    call msp_fermi(h, k, args, info)
+    call check(deviation(k, spectrum(merge(1.0_dp, 0.0_dp, d < 0), cplx, &
+         & 1.3_dp, 0.7_dp)) < 1.0e-4_dp .and. &
+         & info%get_real("inverse_temperature_reached") < 1.0e3_dp, &
+         & "${k}$: Fermi-Dirac stops once W no longer changes")
+    call args%set("max_steps", 3)
+    call msp_fermi(h, k, args, info)
+    call check(.not. info%get_logical("converged") .and. &
+         & info%get_int("steps") == 3, "${k}$: Fermi-Dirac step limit")
+    call k%free()
+    call hs%free()
+  end subroutine test_fermi_${k}$
+
+  !> The density matrix for the overlap S carried to a new overlap: by
+  !> purification (idempotent in the new metric, with the right trace) and
+  !> by Lowdin's transformation (against the dense formula).
+  subroutine test_extrapolation_${k}$(s, dk, overlap, inverse, cplx)
+    type(msp_matrix), intent(in) :: s
+    complex(dp), dimension(n, n), intent(in) :: dk, inverse
+    real(dp), dimension(n), intent(in) :: overlap
+    logical, intent(in) :: cplx
+    type(msp_matrix) :: p, s_new, d, ds, dsd
+    type(msp_dict) :: args, info
+    real(dp), dimension(n) :: moved
+    real(dp) :: trace
+    integer :: i
+
+    moved = overlap * (1 + 0.05_dp * sin([(real(i, dp), i = 1, n)]))
+    call distribute(p, matmul(inverse, matmul(dk, inverse)), grid, cplx, &
+         & device)
+    call distribute(s_new, spectrum(moved, cplx, 0.4_dp, 1.1_dp), grid, &
+         & cplx, device)
+    call args%set("trace", 6.0_dp)
+    call args%set("tolerance", 1.0e-12_dp)
+    call msp_purification_extrapolate(p, s_new, d, args, info)
+    call msp_multiply(d, s_new, ds)
+    call msp_multiply(ds, d, dsd)
+    call msp_dot(d, s_new, trace)
+    call msp_add(dsd, d, alpha=-1.0_dp)
+    call check(msp_norm(dsd) < 1.0e-9_dp .and. abs(trace - 6) < 1.0e-9_dp &
+         & .and. info%get_logical("converged"), &
+         & "${k}$: purification extrapolation")
+
+    call args%clear()
+    call args%set("tolerance", 1.0e-13_dp)
+    call msp_lowdin_extrapolate(p, s, s_new, d, args, info)
+    call check(deviation(d, matmul(spectrum(1 / sqrt(moved), cplx, 0.4_dp, &
+         & 1.1_dp), matmul(dk, spectrum(1 / sqrt(moved), cplx, 0.4_dp, &
+         & 1.1_dp)))) < 1.0e-9_dp, "${k}$: Lowdin extrapolation")
+    call p%free()
+    call s_new%free()
+    call d%free()
+    call ds%free()
+    call dsd%free()
+  end subroutine test_extrapolation_${k}$
+
+#:endfor
+end program test_solvers

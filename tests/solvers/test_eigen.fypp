@@ -1,0 +1,357 @@
+!> Dense eigendecompositions of matrices U D U^H with a known spectrum D,
+!> with every backend built in (cuSOLVERMp only with "device"):
+!> eigenvalues, eigenvectors (orthonormal, and only the first nvals
+!> columns), single precision, a matrix smaller than the process grid, and
+!> matrix functions U f(D) U^H, directly and as the dense method of each
+!> matrix function, Fermi-Dirac density matrices and singular value
+!> decompositions. Real and complex; run on 1, 2 and 4 ranks. With the
+!> argument "device", inputs are moved to the GPU. The other arguments name
+!> calls that must stop the program: a backend that is not built in
+!> ("backend"), eigenvalues outside the domain of the function ("domain"),
+!> and a trace or inverse temperature out of range ("trace",
+!> "temperature").
+program test_eigen
+  use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD
+  use msp_kinds_mod, only: dp
+  use msp_dict_mod, only: msp_dict, msp_args, msp_info, copy
+  use msp_grid_mod, only: msp_grid
+  use msp_matrix_mod
+  use msp_eigen_mod, only: msp_eigen, msp_dense_function, &
+       & msp_dense_available, msp_dense_release
+  use msp_sqrt_mod, only: msp_sqrt, msp_inverse_sqrt, sqrt_impl
+  use msp_inverse_mod, only: msp_inverse
+  use msp_sign_mod, only: msp_sign
+  use msp_exponential_mod, only: msp_exp, msp_log
+  use msp_trigonometry_mod, only: msp_sin, msp_cos, trigonometry_impl
+  use msp_fermi_mod, only: msp_fermi
+  use msp_svd_mod, only: msp_svd
+#:if defined('MSPOLY_GPU')
+  use msp_gpu_csr_mod, only: msp_gpu_allocations
+#:endif
+  use spectral_mod, only: spectrum, distribute, deviation
+  use testing_mod, only: check, finish
+  implicit none
+
+  integer, parameter :: n = 13
+  character(len=10), dimension(2), parameter :: backends = &
+       & [character(len=10) :: "scalapack", "cusolvermp"]
+  type(msp_grid), target :: grid
+  logical :: device
+  character(len=16) :: mode
+  integer :: b
+
+  call get_command_argument(1, mode)
+  device = mode == "device"
+  call msp_select_gpu()
+  call MPI_Init()
+  call grid%init(MPI_COMM_WORLD)
+  if (mode /= "" .and. mode /= "device") call stops(trim(mode))
+  do b = 1, size(backends)
+     if (.not. msp_dense_available(trim(backends(b)))) cycle
+     if (backends(b) == "cusolvermp" .and. .not. device) cycle
+     call test_backend(trim(backends(b)), .false.)
+     call msp_dense_release()
+     call test_backend(trim(backends(b)), .true.)
+     call test_methods(trim(backends(b)), .false.)
+     call test_methods(trim(backends(b)), .true.)
+  end do
+  call msp_dense_release()
+#:if defined('MSPOLY_GPU')
+  call check(msp_gpu_allocations() == 0, "every device allocation released")
+#:endif
+  call grid%free()
+  call finish("test_eigen")
+  call MPI_Finalize()
+
+contains
+
+  !> n points evenly spaced on [low, high].
+  function points(low, high, m) result(x)
+    real(dp), intent(in) :: low, high
+    integer, intent(in) :: m
+    real(dp), dimension(m) :: x
+    integer :: i
+
+    x = [(low + (high - low) * (i - 1) / (m - 1.0_dp), i = 1, m)]
+  end function points
+
+  real(dp) function identity_map(x)
+    real(dp), intent(in) :: x
+
+    identity_map = x
+  end function identity_map
+
+  real(dp) function exp_map(x)
+    real(dp), intent(in) :: x
+
+    exp_map = exp(x)
+  end function exp_map
+
+  !> The n x n matrix with the first k diagonal entries 1, the rest 0.
+  function leading_identity(m, k) result(e)
+    integer, intent(in) :: m, k
+    complex(dp), dimension(m, m) :: e
+    integer :: i
+
+    e = 0
+    do i = 1, k
+       e(i, i) = 1
+    end do
+  end function leading_identity
+
+  subroutine test_backend(backend, cplx)
+    character(*), intent(in) :: backend
+    logical, intent(in) :: cplx
+    character(:), allocatable :: label
+    type(msp_matrix) :: a, v, vh, product
+    type(msp_dict) :: args, info
+    real(dp), dimension(:), allocatable :: values
+    real(dp), dimension(n) :: d
+    real(dp), dimension(3) :: small
+
+    label = backend // merge(" complex", " real   ", cplx)
+    d = points(-3.0_dp, 2.0_dp, n)
+    call distribute(a, spectrum(d, cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+    call args%set("backend", backend)
+
+    call msp_eigen(a, values, args, info, vectors=v)
+    call check(size(values) == n .and. maxval(abs(values - d)) < 1.0e-12_dp &
+         & .and. info%get_string("backend") == backend, label // &
+         & ": eigenvalues")
+    call msp_eigen(a, values, args, info)
+    call check(size(values) == n .and. maxval(abs(values - d)) < 1.0e-12_dp, &
+         & label // ": eigenvalues without vectors")
+    call check(info%get_logical("citations." // &
+         & trim(merge("blackford1997scalapack", "nvidia_cusolvermp     ", &
+         & backend == "scalapack"))), label // ": backend citation")
+    call msp_transpose(v, vh, conjugate=.true.)
+    call msp_multiply(vh, v, product)
+    call check(deviation(product, leading_identity(n, n)) < 1.0e-12_dp .and. &
+         & (v%is_complex() .eqv. cplx) .and. (v%on_device() .eqv. device), &
+         & label // ": orthonormal eigenvectors")
+
+    call args%set("nvals", 5)
+    call msp_eigen(a, values, args, info, vectors=v)
+    call msp_transpose(v, vh, conjugate=.true.)
+    call msp_multiply(vh, v, product)
+    call check(size(values) == 5 .and. maxval(abs(values - d(1:5))) < &
+         & 1.0e-12_dp .and. deviation(product, leading_identity(n, 5)) < &
+         & 1.0e-12_dp, label // ": the lowest nvals")
+    call args%remove("nvals")
+
+    call msp_dense_function(a, product, identity_map, args, info)
+    call check(deviation(product, spectrum(d, cplx, 1.3_dp, 0.7_dp)) < &
+         & 1.0e-12_dp, label // ": V D V^H")
+    call msp_dense_function(a, product, exp_map, args, info)
+    call check(deviation(product, spectrum(exp(d), cplx, 1.3_dp, 0.7_dp)) < &
+         & 1.0e-12_dp, label // ": exponential")
+
+    call msp_to_single(a)
+    call msp_eigen(a, values, args, info, vectors=v)
+    call check(maxval(abs(values - d)) < 1.0e-5_dp .and. v%is_single(), &
+         & label // ": single precision")
+
+    small = [-1.0_dp, 0.5_dp, 2.0_dp]
+    call distribute(a, spectrum(small, cplx, 1.3_dp, 0.7_dp), grid, cplx, &
+         & device)
+    call msp_dense_function(a, product, exp_map, args, info)
+    call check(deviation(product, spectrum(exp(small), cplx, 1.3_dp, &
+         & 0.7_dp)) < 1.0e-12_dp, label // ": smaller than the grid")
+
+    call a%free()
+    call v%free()
+    call vh%free()
+    call product%free()
+  end subroutine test_backend
+
+  !> The dense method of each matrix function, Fermi-Dirac density matrices
+  !> and the singular value decomposition.
+  subroutine test_methods(backend, cplx)
+    character(*), intent(in) :: backend
+    logical, intent(in) :: cplx
+    character(:), allocatable :: label
+    type(msp_matrix) :: a, x, y, left, right, lh, product
+    type(msp_dict) :: args
+    type(msp_dict), target :: tracked, info
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+    real(dp), dimension(:), allocatable :: values
+    real(dp), dimension(n) :: d, p, f
+    real(dp) :: mu, low, high
+    integer :: step
+
+    label = backend // merge(" complex", " real   ", cplx)
+    d = points(-3.0_dp, 2.0_dp, n)
+    p = points(0.5_dp, 3.0_dp, n)
+    call args%set("backend", backend)
+    call args%set("method", "dense")
+
+    call make_matrix(a, p, cplx)
+    call msp_sqrt(a, x, args, info)
+    call check(matches(x, sqrt(p), cplx), label // ": dense square root")
+    call msp_inverse_sqrt(a, x, args, info)
+    call check(matches(x, 1 / sqrt(p), cplx), label // &
+         & ": dense inverse square root")
+    call msp_inverse(a, x, args, info)
+    call check(matches(x, 1 / p, cplx), label // ": dense inverse")
+    call msp_log(a, x, args, info)
+    call check(matches(x, log(p), cplx), label // ": dense logarithm")
+
+    call copy(tracked, args)
+    call a_args%open(tracked)
+    call r%open(info)
+    call sqrt_impl(a, a_args, r, root=x, inverse_root=y)
+    call a_args%finish(r)
+    call check(matches(x, sqrt(p), cplx) .and. matches(y, 1 / sqrt(p), &
+         & cplx), label // ": dense roots from one decomposition")
+
+    call make_matrix(a, d, cplx)
+    call msp_sign(a, x, args, info)
+    call check(matches(x, sign(1.0_dp, d), cplx), label // ": dense sign")
+    call msp_exp(a, x, args, info)
+    call check(matches(x, exp(d), cplx), label // ": dense exponential")
+    call msp_sin(a, x, args, info)
+    call check(matches(x, sin(d), cplx), label // ": dense sine")
+    call msp_cos(a, x, args, info)
+    call check(matches(x, cos(d), cplx), label // ": dense cosine")
+    call a_args%open(tracked)
+    call r%open(info)
+    call trigonometry_impl(a, a_args, r, sine=x, cosine=y)
+    call a_args%finish(r)
+    call check(matches(x, sin(d), cplx) .and. matches(y, cos(d), cplx), &
+         & label // ": dense sine and cosine from one decomposition")
+
+    call args%set("inverse_temperature", 2.0_dp)
+    call args%set("chemical_potential", -0.5_dp)
+    call msp_fermi(a, x, args, info)
+    f = 1 / (1 + exp(2 * (d + 0.5_dp)))
+    call check(matches(x, f, cplx) .and. &
+         & abs(info%get_real("energy") - sum(f * d)) < 1.0e-12_dp, &
+         & label // ": dense Fermi-Dirac, grand canonical")
+    low = -6
+    high = 6
+    do step = 1, 60
+       mu = (low + high) / 2
+       if (sum(1 / (1 + exp(2 * (d - mu)))) > 6) then
+          high = mu
+       else
+          low = mu
+       end if
+    end do
+    call args%remove("chemical_potential")
+    call args%set("trace", 6.0_dp)
+    call msp_fermi(a, x, args, info)
+    call check(matches(x, 1 / (1 + exp(2 * (d - mu))), cplx) .and. &
+         & abs(info%get_real("chemical_potential") - mu) < 1.0e-10_dp, &
+         & label // ": dense Fermi-Dirac, canonical")
+    call args%remove("inverse_temperature")
+    call msp_fermi(a, x, args, info)
+    f = 0
+    f(1:6) = 1
+    call check(matches(x, f, cplx) .and. abs(info%get_real("energy") - &
+         & sum(d(1:6))) < 1.0e-12_dp .and. &
+         & abs(info%get_real("chemical_potential") - (d(6) + d(7)) / 2) < &
+         & 1.0e-12_dp, label // ": dense density matrix, zero temperature")
+    call args%remove("trace")
+    call args%remove("method")
+
+    !! A = U diag(d) U^H is Hermitian and indefinite: its singular values
+    !! are |d|, its polar factors sign(A) and |A|.
+    call msp_svd(a, values, args, info, left=left, right=right)
+    call msp_transpose(left, lh, conjugate=.true.)
+    call msp_multiply(lh, a, x)
+    call msp_multiply(x, right, product)
+    call check(maxval(abs(values - sorted(abs(d)))) < 1.0e-10_dp .and. &
+         & deviation(product, diagonal(values)) < 1.0e-9_dp, label // &
+         & ": singular value decomposition")
+
+    call a%free()
+    call x%free()
+    call y%free()
+    call left%free()
+    call right%free()
+    call lh%free()
+    call product%free()
+
+  end subroutine test_methods
+
+  !> m becomes U diag(e) U^H, with the eigenvectors used throughout.
+  subroutine make_matrix(m, e, cplx)
+    type(msp_matrix), intent(inout) :: m
+    real(dp), dimension(n), intent(in) :: e
+    logical, intent(in) :: cplx
+
+    call distribute(m, spectrum(e, cplx, 1.3_dp, 0.7_dp), grid, cplx, device)
+  end subroutine make_matrix
+
+  !> Whether m is U diag(fe) U^H.
+  logical function matches(m, fe, cplx)
+    type(msp_matrix), intent(in) :: m
+    real(dp), dimension(n), intent(in) :: fe
+    logical, intent(in) :: cplx
+
+    matches = deviation(m, spectrum(fe, cplx, 1.3_dp, 0.7_dp)) < 1.0e-10_dp
+  end function matches
+
+  !> x in ascending order.
+  function sorted(x) result(y)
+    real(dp), dimension(:), intent(in) :: x
+    real(dp), dimension(size(x)) :: y
+    integer :: i, j
+    real(dp) :: t
+
+    y = x
+    do i = 2, size(y)
+       t = y(i)
+       j = i - 1
+       do while (j >= 1)
+          if (y(j) <= t) exit
+          y(j + 1) = y(j)
+          j = j - 1
+       end do
+       y(j + 1) = t
+    end do
+  end function sorted
+
+  !> The square matrix with diagonal x.
+  function diagonal(x) result(m)
+    real(dp), dimension(:), intent(in) :: x
+    complex(dp), dimension(size(x), size(x)) :: m
+    integer :: i
+
+    m = 0
+    do i = 1, size(x)
+       m(i, i) = x(i)
+    end do
+  end function diagonal
+
+  !> Calls that must stop the program, by mode.
+  subroutine stops(what)
+    character(*), intent(in) :: what
+    type(msp_matrix) :: a, x
+    type(msp_dict) :: args, info
+    real(dp), dimension(:), allocatable :: values
+
+    select case (what)
+    case ("backend")
+       call distribute(a, spectrum(points(1.0_dp, 2.0_dp, n), .false., &
+            & 1.3_dp, 0.7_dp), grid, .false., .false.)
+       call args%set("backend", "magma")
+       call msp_eigen(a, values, args, info)
+    case ("domain")
+       call distribute(a, spectrum(points(-1.0_dp, 2.0_dp, n), .false., &
+            & 1.3_dp, 0.7_dp), grid, .false., .false.)
+       call args%set("method", "dense")
+       call msp_log(a, x, args, info)
+    case default
+       call distribute(a, spectrum(points(-1.0_dp, 2.0_dp, n), .false., &
+            & 1.3_dp, 0.7_dp), grid, .false., .false.)
+       call args%set("method", "dense")
+       call args%set("trace", merge(n + 1.0_dp, 3.0_dp, what == "trace"))
+       if (what == "temperature") call args%set("inverse_temperature", &
+            & 0.0_dp)
+       call msp_fermi(a, x, args, info)
+    end select
+    write (*, '(a)') "did not stop"
+  end subroutine stops
+end program test_eigen

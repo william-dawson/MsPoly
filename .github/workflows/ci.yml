@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gfortran:
+    name: gfortran ${{ matrix.version }} ${{ matrix.build }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["13", "14"]
+        build: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran-${{ matrix.version }} libopenmpi-dev openmpi-bin \
+            libscalapack-openmpi-dev
+          pipx install fypp
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+          -DCMAKE_Fortran_COMPILER=gfortran-${{ matrix.version }}
+          -DFYPP=$(command -v fypp) -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe
+          -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  standard:
+    name: Fortran 2008 conformance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran-14 libopenmpi-dev openmpi-bin \
+            libscalapack-openmpi-dev
+          pipx install fypp
+      - name: Build with -std=f2008 -pedantic -Werror
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_Fortran_COMPILER=gfortran-14 -DFYPP=$(command -v fypp) \
+            -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe \
+            -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi \
+            -DCMAKE_Fortran_FLAGS="-pedantic -Werror"
+          cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  nvfortran:
+    name: nvfortran ${{ matrix.nvhpc.version }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: nvcr.io/nvidia/nvhpc:${{ matrix.nvhpc.version }}-devel-${{ matrix.nvhpc.cuda }}-ubuntu24.04
+    env:
+      OMPI_ALLOW_RUN_AS_ROOT: 1
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        nvhpc:
+          - { version: "26.3", cuda: cuda13.1 }
+          - { version: "26.5", cuda: cuda13.2 }
+          - { version: "26.9", cuda: cuda13.3 }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install
+        run: |
+          apt-get update
+          apt-get install -y cmake python3-venv
+          python3 -m venv /opt/fypp && /opt/fypp/bin/pip install fypp
+          if ! command -v mpifort; then
+            dirname "$(find /opt/nvidia/hpc_sdk -path '*comm_libs/mpi/bin/mpifort' | head -1)" >> $GITHUB_PATH
+          fi
+      - name: Build and test (Debug, Release, GPU); any compiler warning fails
+        shell: bash
+        run: |
+          # The runners have no GPU or driver: the GPU build, with
+          # cuSOLVERMp, is compiled, and its CPU tests run (label gpu
+          # excluded) except the solver tests, whose cuSOLVERMp needs the
+          # driver to load.
+          math=$(dirname "$(find /opt/nvidia/hpc_sdk -name cusolverMp.h | head -1)")/..
+          nccl=$(dirname "$(find /opt/nvidia/hpc_sdk -path '*nccl/include/nccl.h' | head -1)")/..
+          for build in Debug Release GPU; do
+            options="-DCMAKE_BUILD_TYPE=$build"
+            if [ $build = GPU ]; then
+              options="-DCMAKE_BUILD_TYPE=Release -DMSPOLY_GPU=ON -DMSPOLY_BUILD_BENCH=ON
+                -DMSPOLY_CUSOLVERMP=ON -DCMAKE_PREFIX_PATH=$math;$nccl"
+            fi
+            cmake -S . -B build-$build $options \
+              -DCMAKE_Fortran_COMPILER=nvfortran -DFYPP=/opt/fypp/bin/fypp \
+              -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe
+            cmake --build build-$build -j 4 2>&1 | tee build-$build.log
+            test ${PIPESTATUS[0]} -eq 0
+            if grep -E 'NVFORTRAN-W' build-$build.log; then
+              echo "::error::nvfortran $build build has warnings"; exit 1
+            fi
+            exclude=gpu
+            if [ $build = GPU ]; then exclude="gpu|solvers"; fi
+            OMP_NUM_THREADS=2 ctest --test-dir build-$build --output-on-failure -LE "$exclude"
+          done
+      - name: Compiler reproducers (informational)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          tools/compiler-probes/nvidia/run.sh nvfortran
+          {
+            echo "### nvfortran ${{ matrix.nvhpc.version }} ${{ matrix.arch }} reproducers"
+            echo '```'
+            cat tools/compiler-probes/nvidia/results.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran-14 bc libopenmpi-dev openmpi-bin \
+            libscalapack-openmpi-dev
+          pipx install fypp
+      - name: Measure
+        env:
+          GCOV: gcov-14
+          FC: gfortran-14
+        run: |
+          tools/coverage.sh build-coverage -DMSPOLY_MPIEXEC_FLAGS=--oversubscribe \
+            -DMSPOLY_SCALAPACK=ON -DMSPOLY_SCALAPACK_LIBRARIES=scalapack-openmpi | tee coverage.txt
+          {
+            echo "### Line coverage"
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: |
+            coverage.txt
+            build-coverage/src/**/*.gcov

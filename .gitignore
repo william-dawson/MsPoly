@@ -1,0 +1,5 @@
+# Build trees
+/build*/
+*.o
+*.mod
+*.smod

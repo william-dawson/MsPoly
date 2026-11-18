@@ -1,0 +1,137 @@
+#! Every value type through every typed entry point: dictionary set/get/
+#! append, defaults, type errors, scoped views and reports.
+#! (suffix, element type, read type, first value, second value, equality)
+#:set CASES = [ &
+  ('l', 'logical', 'logical', '.true.', '.false.', '.eqv.'), &
+  ('i', 'integer(i64)', 'integer(i64)', '9000000000_i64', '-3_i64', '=='), &
+  ('i32', 'integer', 'integer', '7', '-3', '=='), &
+  ('r', 'real(dp)', 'real(dp)', '1.5_dp', '-2.25_dp', '=='), &
+  ('c', 'complex(dp)', 'complex(dp)', '(1.0_dp, -1.0_dp)', '(0.0_dp, 2.0_dp)', '=='), &
+  ('s', 'character(len=5)', 'character(:)', '"alpha"', '"be"', '==')]
+#:set FUNCTION = {'l': 'get_logical', 'i32': 'get_int', 'r': 'get_real', &
+                  'c': 'get_complex', 's': 'get_string'}
+program test_values
+  use msp_kinds_mod, only: dp, i64
+  use msp_dict_mod
+  use testing_mod, only: check, finish
+  implicit none
+
+#:for t, elem, rtype, a, b, eq in CASES
+  call test_${t}$()
+#:endfor
+  call test_conversions()
+  call finish("test_values")
+
+contains
+
+#:for t, elem, rtype, a, b, eq in CASES
+  subroutine test_${t}$()
+    type(msp_dict), target :: d, report
+    type(msp_args) :: args, inner
+    type(msp_info) :: info, inner_info
+  #:if t == 's'
+    character(:), allocatable :: got
+    character(:), allocatable :: got1(:)
+  #:else
+    ${rtype}$ :: got
+    ${rtype}$, allocatable :: got1(:)
+  #:endif
+    ${elem}$ :: pair(2)
+    integer :: stat
+
+    pair = [${elem}$ :: ${a}$, ${b}$]
+    call d%set("x", ${a}$)
+    call d%set("v", pair)
+    call d%append("h", ${a}$)
+    call d%append("h", ${b}$)
+  #:if t == 's'
+    call d%set("wrong", 1)
+  #:else
+    call d%set("wrong", "text")
+  #:endif
+
+    call d%get("x", got)
+    call check((got ${eq}$ ${a}$), "${t}$: scalar round trip")
+    call d%get("v", got1)
+    call check(size(got1) == 2 .and. (got1(2) ${eq}$ ${b}$), &
+         & "${t}$: array round trip")
+    call d%get("h", got1)
+    call check(size(got1) == 2 .and. (got1(1) ${eq}$ ${a}$) .and. &
+         & (got1(2) ${eq}$ ${b}$), "${t}$: append builds an array")
+    call d%get("missing", got, default=${b}$)
+    call check((got ${eq}$ ${b}$), "${t}$: default for a missing key")
+    call d%get("missing", got1, default=pair)
+    call check(size(got1) == 2, "${t}$: array default")
+    call d%get("x", got1, stat=stat)
+    call check(stat /= 0, "${t}$: a scalar is not read as an array")
+    call d%get("wrong", got, stat=stat)
+    call check(stat /= 0, "${t}$: another type is an error")
+    call d%append("x", ${a}$, stat=stat)
+    call check(stat /= 0, "${t}$: append to a scalar is an error")
+  #:if t in FUNCTION
+    call check((d%${FUNCTION[t]}$("x") ${eq}$ ${a}$), "${t}$: function getter")
+  #:endif
+
+    call args%open(d)
+    call args%enter("sub", inner)
+    call inner%get("x", got, scoped=.true.)
+    call inner%get("v", got1, scoped=.true.)
+    call check((got ${eq}$ ${a}$) .and. size(got1) == 2, &
+         & "${t}$: scoped view reads scalar and array")
+
+    call info%open(report)
+    call info%enter("sub", inner_info)
+    call inner_info%set("x", ${a}$)
+    call inner_info%set("v", pair)
+    call inner_info%append("h", ${b}$)
+    call check(report%has("sub.x") .and. report%length_of("sub.v") == 2 &
+         & .and. report%length_of("sub.h") == 1, "${t}$: report view writes")
+  end subroutine test_${t}$
+
+#:endfor
+  subroutine test_conversions()
+    type(msp_dict) :: d
+    real(dp) :: r
+    real(dp), allocatable :: r1(:)
+    integer :: i, stat
+    integer(i64) :: minimum
+    integer, allocatable :: i1(:)
+
+    call d%set("n", 3)
+    call d%set("ns", [1, 2])
+    call d%set("x", 2.5_dp)
+    call d%set("big", 9000000000_i64)
+    call d%set("bigs", [1_i64, 9000000000_i64])
+    call d%get("n", r)
+    call d%get("ns", r1)
+    call check(r == 3.0_dp .and. all(r1 == [1.0_dp, 2.0_dp]), &
+         & "integers are read as reals")
+    call d%get("x", i, stat=stat)
+    call check(stat /= 0, "reals are not read as integers")
+    call d%get("big", i, stat=stat)
+    call check(stat /= 0, "int64 too large for a default integer")
+    call d%get("bigs", i1, stat=stat)
+    call check(stat /= 0, "int64 array too large for default integers")
+    call d%append("ns", 2.0_dp, stat=stat)
+    call check(stat /= 0, "a real is not appended to an integer array")
+    call d%set("minimum", -int(huge(1), i64) - 1_i64)
+    call d%get("minimum", i, stat=stat)
+    call check(stat == 0, "the minimum default integer is representable")
+    if (stat == 0) call check(int(i, i64) == -int(huge(1), i64) - 1_i64, &
+         & "minimum default integer scalar value")
+    call d%set("limits", [-int(huge(1), i64) - 1_i64, int(huge(1), i64)])
+    call d%get("limits", i1, stat=stat)
+    call check(stat == 0, "both default integer endpoints are representable")
+    if (stat == 0) call check(all(int(i1, i64) == &
+         & [-int(huge(1), i64) - 1_i64, int(huge(1), i64)]), &
+         & "default integer array endpoint values")
+    minimum = huge(1_i64)
+    minimum = not(minimum)
+    call d%set("minimum64", minimum)
+    call d%get("minimum64", i, stat=stat)
+    call check(stat /= 0, "minimum int64 cannot narrow to a default integer")
+    call d%set("minimum64s", [minimum])
+    call d%get("minimum64s", i1, stat=stat)
+    call check(stat /= 0, "minimum int64 array cannot narrow")
+  end subroutine test_conversions
+end program test_values

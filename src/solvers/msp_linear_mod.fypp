@@ -1,0 +1,488 @@
+!> Linear systems and Cholesky factorizations.
+module msp_linear_mod
+#:if defined('MSPOLY_GPU')
+  use, intrinsic :: iso_c_binding, only: c_ptr, c_null_ptr, c_int, &
+       & c_double, c_loc
+#:endif
+  use mpi_f08, only: MPI_Gather, MPI_Gatherv, MPI_Bcast, MPI_INTEGER, &
+       & MPI_DOUBLE_COMPLEX
+  use msp_kinds_mod, only: dp
+  use msp_error_mod, only: msp_raise
+  use msp_dict_mod, only: msp_dict, msp_args, msp_info, copy
+  use msp_matrix_mod
+  implicit none
+  private
+
+  public :: msp_cg, msp_cholesky, msp_pivoted_cholesky, cg_impl
+
+  !> A sparse vector of growing length.
+  type :: sparse_t
+     integer :: count = 0
+     integer, dimension(:), allocatable :: index
+     complex(dp), dimension(:), allocatable :: value
+  end type sparse_t
+
+#:if defined('MSPOLY_GPU')
+  interface
+     integer(c_int) function gpu_open(n, rank, cplx, ptr, index, value, &
+          & handle) bind(c, name="msp_pivot_gpu_open")
+       import :: c_int, c_ptr
+       integer(c_int), value :: n, rank, cplx
+       type(c_ptr), value :: ptr, index, value
+       type(c_ptr), intent(out) :: handle
+     end function gpu_open
+     integer(c_int) function gpu_step(handle, column, tolerance, pivot) &
+          & bind(c, name="msp_pivot_gpu_step")
+       import :: c_int, c_ptr, c_double
+       type(c_ptr), value :: handle
+       integer(c_int), value :: column
+       real(c_double), value :: tolerance
+       integer(c_int), intent(out) :: pivot
+     end function gpu_step
+     integer(c_int) function gpu_close(handle, columns, output) &
+          & bind(c, name="msp_pivot_gpu_close")
+       import :: c_int, c_ptr
+       type(c_ptr), value :: handle, output
+       integer(c_int), value :: columns
+     end function gpu_close
+  end interface
+#:endif
+
+contains
+
+  !> X becomes the solution of A X = B for a Hermitian positive definite A.
+  !> Collective. args and info as for cg_impl.
+  subroutine msp_cg(A, X, B, args, info, context)
+    type(msp_matrix), intent(in) :: A, B
+    type(msp_matrix), intent(inout) :: X
+    type(msp_dict), intent(in) :: args
+    type(msp_dict), intent(inout), target :: info
+    type(msp_dict), intent(in), target, optional :: context
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call cg_impl(A, B, a_args, r, X)
+    call a_args%finish(r)
+  end subroutine msp_cg
+
+  !> Conjugate gradients on the matrix space: the columns of X are solved
+  !> together, with the Frobenius inner product <U, V> = tr(U^H V), which A
+  !> X -> A X keeps Hermitian positive definite. X starts at 0.
+  !>
+  !> It stops when |B - A X|_F is at most the tolerance.
+  !>
+  !> args: threshold (scoped, default 0), tolerance (scoped, default 1e-10),
+  !> max_iterations (default 1000).
+  !> info: iterations, converged, residual_history (initial and each update).
+  subroutine cg_impl(A, B, args, info, X)
+    type(msp_matrix), intent(in) :: A, B
+    type(msp_args), intent(in) :: args
+    type(msp_info), intent(in) :: info
+    type(msp_matrix), intent(inout) :: X
+    type(msp_matrix) :: r, p, q
+    real(dp) :: threshold, tolerance, rr, previous, pq, residual
+    integer :: max_iterations, step, iterations
+    logical :: converged
+
+    call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
+    call args%get("tolerance", tolerance, default=1.0e-10_dp, scoped=.true.)
+    call args%get("max_iterations", max_iterations, default=1000)
+    call copy(X, B)
+    call msp_scale(X, 0.0_dp)
+    call copy(r, B)
+    call copy(p, B)
+    call msp_dot(r, r, rr)
+    residual = sqrt(rr)
+    call info%append("residual_history", residual)
+    converged = residual <= tolerance
+    iterations = 0
+    do step = 1, max_iterations
+       if (converged) exit
+       call msp_multiply(A, p, q, threshold=threshold)
+       call msp_dot(p, q, pq)
+       !! Absolute pruning can erase A p to an empty matrix once the
+       !! residual is at the rounding level; recompute the product
+       !! unpruned rather than divide by zero.
+       if (pq == 0) then
+          call msp_multiply(A, p, q)
+          call msp_dot(p, q, pq)
+       end if
+       call msp_add(X, p, alpha=rr / pq, threshold=threshold)
+       call msp_add(r, q, alpha=-rr / pq, threshold=threshold)
+       previous = rr
+       call msp_dot(r, r, rr)
+       call msp_scale(p, rr / previous)
+       call msp_add(p, r, threshold=threshold)
+       iterations = step
+       residual = sqrt(rr)
+       call info%append("residual_history", residual)
+       converged = residual <= tolerance
+    end do
+    call info%set("iterations", iterations)
+    call info%set("converged", converged)
+    call r%free()
+    call p%free()
+    call q%free()
+  end subroutine cg_impl
+
+  !> L becomes the lower triangular factor of the Hermitian positive
+  !> definite A = L L^H. Collective.
+  !>
+  !> Each column depends on all before it, so the factorization is
+  !> sequential: the entries are gathered to the first rank, factored there
+  !> by left-looking sparse Cholesky, and distributed again. Memory on that
+  !> rank grows with the entries of A and L, not with n^2.
+  !>
+  !> info: nnz (entries of L).
+  subroutine msp_cholesky(A, L, args, info, context)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: L
+    type(msp_dict), intent(in) :: args
+    type(msp_dict), intent(inout), target :: info
+    type(msp_dict), intent(in), target, optional :: context
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+    type(sparse_t), dimension(:), allocatable :: columns, lower, rows
+    complex(dp), dimension(:), allocatable :: w
+    logical, dimension(:), allocatable :: touched
+    integer, dimension(:), allocatable :: list
+    real(dp) :: d
+    integer :: j, k, q, m, row
+
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call gather(A, columns)
+    if (A%grid%rank == 0) then
+       allocate(lower(A%n), rows(A%n), w(A%n), touched(A%n), list(A%n))
+       w = 0
+       touched = .false.
+       do j = 1, A%n
+          m = 0
+          do q = 1, columns(j)%count
+             if (columns(j)%index(q) >= j) call put(columns(j)%index(q), &
+                  & columns(j)%value(q))
+          end do
+          !! Subtract L(:, k) conj(L(j, k)) for every k < j with L(j, k)
+          !! nonzero, found in the row list of j.
+          do k = 1, rows(j)%count
+             associate (c => lower(rows(j)%index(k)))
+               do q = 1, c%count
+                  if (c%index(q) >= j) call put(c%index(q), -c%value(q) * &
+                       & conjg(rows(j)%value(k)))
+               end do
+             end associate
+          end do
+          d = real(w(j), dp)
+          if (d <= 0) call msp_raise("msp_cholesky: the matrix is not " // &
+               & "positive definite")
+          do q = 1, m
+             row = list(q)
+             if (row == j) then
+                call append(lower(j), j, cmplx(sqrt(d), 0.0_dp, dp))
+             else if (w(row) /= 0) then
+                call append(lower(j), row, w(row) / sqrt(d))
+                call append(rows(row), j, w(row) / sqrt(d))
+             end if
+             w(row) = 0
+             touched(row) = .false.
+          end do
+       end do
+    end if
+    call scatter(A, L, lower)
+    call r%set("nnz", L%nnz())
+    call a_args%finish(r)
+
+  contains
+
+    !> w(row) = w(row) + v, listing row when first touched.
+    subroutine put(row, v)
+      integer, intent(in) :: row
+      complex(dp), intent(in) :: v
+
+      if (.not. touched(row)) then
+         touched(row) = .true.
+         m = m + 1
+         list(m) = row
+      end if
+      w(row) = w(row) + v
+    end subroutine put
+  end subroutine msp_cholesky
+
+  !> L becomes the first columns of a pivoted Cholesky factor of the
+  !> Hermitian positive semidefinite A, A ~ L L^H, with L of rank args
+  !> "rank" (required) or less: column j comes from the row and column with
+  !> the largest remaining diagonal, and the factorization stops early when
+  !> that diagonal is at most args "tolerance" (scoped, default 1e-12).
+  !> Collective. Pivots are sequential; backend "gpu" evaluates columns
+  !> and updates diagonals on the first rank's GPU, using sparse input and
+  !> a dense n by rank factor. Backend "sparse" keeps sparse CPU factors.
+  !> The default "auto" selects gpu for device matrices, sparse otherwise.
+  !>
+  !> info: rank (columns computed).
+  subroutine msp_pivoted_cholesky(A, L, args, info, context)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: L
+    type(msp_dict), intent(in) :: args
+    type(msp_dict), intent(inout), target :: info
+    type(msp_dict), intent(in), target, optional :: context
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+#:if defined('MSPOLY_GPU')
+    type(msp_dict) :: err
+#:endif
+    type(sparse_t), dimension(:), allocatable :: columns, lower, rows
+    complex(dp), dimension(:), allocatable :: w
+    real(dp), dimension(:), allocatable :: d
+    logical, dimension(:), allocatable :: chosen
+    integer, dimension(:), allocatable :: pivots, chosen_pivots
+    character(:), allocatable :: backend
+    real(dp) :: tolerance, pivot
+    integer :: rank, computed, j, k, q, p, row
+
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call a_args%get("rank", rank)
+    call a_args%get("tolerance", tolerance, default=1.0e-12_dp, scoped=.true.)
+    call a_args%get("backend", backend, default="auto")
+    if (backend == "auto") then
+       backend = "sparse"
+       if (A%on_device()) backend = "gpu"
+    end if
+    select case (backend)
+    case ("sparse")
+#:if defined('MSPOLY_GPU')
+    case ("gpu")
+#:endif
+    case default
+       call msp_raise("msp_pivoted_cholesky: backend '" // backend // &
+            & "' is not built in")
+    end select
+    rank = max(0, min(rank, A%n))
+    allocate(pivots(rank))
+    pivots = 0
+    call gather(A, columns)
+    computed = 0
+#:if defined('MSPOLY_GPU')
+    if (backend == "gpu") then
+       if (A%grid%rank == 0) call pivot_gpu(columns, rank, tolerance, &
+            & A%is_complex(), lower, computed, pivots, err)
+       call A%grid%agree(err)
+    else
+#:endif
+    if (A%grid%rank == 0) then
+       allocate(lower(A%n), rows(A%n), w(A%n), d(A%n), chosen(A%n))
+       d = 0
+       do j = 1, A%n
+          do q = 1, columns(j)%count
+             if (columns(j)%index(q) == j) d(j) = real(columns(j)%value(q), dp)
+          end do
+       end do
+       chosen = .false.
+       do j = 1, min(rank, A%n)
+          p = maxloc(d, 1, mask=.not. chosen)
+          pivot = d(p)
+          if (pivot <= tolerance) exit
+          pivots(j) = p
+          w = 0
+          do q = 1, columns(p)%count
+             w(columns(p)%index(q)) = columns(p)%value(q)
+          end do
+          do k = 1, rows(p)%count
+             associate (c => lower(rows(p)%index(k)))
+               do q = 1, c%count
+                  w(c%index(q)) = w(c%index(q)) - c%value(q) * &
+                       & conjg(rows(p)%value(k))
+               end do
+             end associate
+          end do
+          chosen(p) = .true.
+          do row = 1, A%n
+             if (w(row) == 0 .or. (chosen(row) .and. row /= p)) cycle
+             call append(lower(j), row, w(row) / sqrt(pivot))
+             call append(rows(row), j, w(row) / sqrt(pivot))
+             d(row) = d(row) - abs(w(row))**2 / pivot
+          end do
+          computed = j
+       end do
+    end if
+#:if defined('MSPOLY_GPU')
+    end if
+#:endif
+    call scatter(A, L, lower)
+    call MPI_Bcast(computed, 1, MPI_INTEGER, 0, A%grid%comm)
+    call MPI_Bcast(pivots, computed, MPI_INTEGER, 0, A%grid%comm)
+    call r%set("rank", computed)
+    allocate(chosen_pivots(computed))
+    chosen_pivots = pivots(1:computed)
+    call r%set("pivots", chosen_pivots)
+    call r%set("backend", backend)
+    call a_args%finish(r)
+  end subroutine msp_pivoted_cholesky
+
+#:if defined('MSPOLY_GPU')
+  !> Sequential pivot control with GPU column evaluation and diagonals.
+  subroutine pivot_gpu(columns, rank, tolerance, cplx, lower, computed, &
+       & pivots, err)
+    type(sparse_t), intent(in) :: columns(:)
+    integer, intent(in) :: rank
+    real(dp), intent(in) :: tolerance
+    logical, intent(in) :: cplx
+    type(sparse_t), allocatable, intent(out) :: lower(:)
+    integer, intent(out) :: computed
+    integer, intent(out) :: pivots(:)
+    type(msp_dict), intent(inout) :: err
+    integer, allocatable, target :: ptr(:), index(:)
+    complex(dp), allocatable, target :: value(:), lc(:, :)
+    real(dp), allocatable, target :: lr(:, :)
+    type(c_ptr) :: handle, output
+    integer :: n, j, row, offset, count, status, close_status, p
+
+    n = size(columns)
+    allocate(lower(n))
+    computed = 0
+    if (rank == 0) return
+    allocate(ptr(n + 1), index(sum(columns%count)), &
+         & value(sum(columns%count)))
+    offset = 0
+    ptr(1) = 0
+    do j = 1, n
+       count = columns(j)%count
+       if (count > 0) then
+          index(offset + 1:offset + count) = columns(j)%index(1:count) - 1
+          value(offset + 1:offset + count) = columns(j)%value(1:count)
+       end if
+       offset = offset + count
+       ptr(j + 1) = offset
+    end do
+    handle = c_null_ptr
+    status = gpu_open(n, rank, merge(1, 0, cplx), c_loc(ptr), &
+         & c_loc(index), c_loc(value), handle)
+    if (status /= 0) then
+       call err%set("message", "msp_pivoted_cholesky: GPU setup failed")
+       return
+    end if
+    do j = 1, rank
+       status = gpu_step(handle, j - 1, tolerance, p)
+       if (status /= 0 .or. p == 0) exit
+       pivots(j) = p
+       computed = j
+    end do
+    if (cplx) then
+       allocate(lc(n, computed))
+       output = c_loc(lc)
+    else
+       allocate(lr(n, computed))
+       output = c_loc(lr)
+    end if
+    close_status = gpu_close(handle, computed, output)
+    if (status /= 0 .or. close_status /= 0) then
+       call err%set("message", "msp_pivoted_cholesky: GPU factor failed")
+       return
+    end if
+    do j = 1, computed
+       do row = 1, n
+          if (cplx) then
+             if (lc(row, j) /= 0) call append(lower(j), row, lc(row, j))
+          else
+             if (lr(row, j) /= 0) call append(lower(j), row, &
+                  & cmplx(lr(row, j), 0.0_dp, dp))
+          end if
+       end do
+    end do
+  end subroutine pivot_gpu
+#:endif
+
+  !> On the first rank, the columns of A (with global row indices); other
+  !> ranks get none.
+  subroutine gather(A, columns)
+    type(msp_matrix), intent(in) :: A
+    type(sparse_t), dimension(:), allocatable, intent(out) :: columns
+    integer, dimension(:), allocatable :: i, j, all_i, all_j, counts, &
+         & displs
+    complex(dp), dimension(:), allocatable :: v, all_v
+    integer :: k
+
+    call A%entries(i, j, v)
+    !! Only the first rank receives: the counts stay 0 elsewhere.
+    allocate(counts(A%grid%size))
+    counts = 0
+    call MPI_Gather([size(i)], 1, MPI_INTEGER, counts, 1, MPI_INTEGER, 0, &
+         & A%grid%comm)
+    displs = [0, (sum(counts(1:k)), k = 1, A%grid%size - 1)]
+    allocate(all_i(sum(counts)), all_j(sum(counts)), all_v(sum(counts)))
+    call MPI_Gatherv(i, size(i), MPI_INTEGER, all_i, counts, displs, &
+         & MPI_INTEGER, 0, A%grid%comm)
+    call MPI_Gatherv(j, size(j), MPI_INTEGER, all_j, counts, displs, &
+         & MPI_INTEGER, 0, A%grid%comm)
+    call MPI_Gatherv(v, size(v), MPI_DOUBLE_COMPLEX, all_v, counts, displs, &
+         & MPI_DOUBLE_COMPLEX, 0, A%grid%comm)
+    allocate(columns(A%n))
+    if (A%grid%rank /= 0) return
+    do k = 1, size(all_i)
+       call append(columns(all_j(k)), all_i(k), all_v(k))
+    end do
+  end subroutine gather
+
+  !> L becomes the matrix with columns lower (held by the first rank), real
+  !> when A is, with the precision and location of A.
+  subroutine scatter(A, L, lower)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: L
+    type(sparse_t), dimension(:), allocatable, intent(in) :: lower
+    integer, dimension(:), allocatable :: i, j
+    complex(dp), dimension(:), allocatable :: v
+    integer :: k, total, offset, count
+
+    total = 0
+    if (allocated(lower)) total = sum(lower%count)
+    allocate(i(total), j(total), v(total))
+    if (allocated(lower)) then
+       offset = 0
+       do k = 1, size(lower)
+          count = lower(k)%count
+          if (count == 0) cycle
+          i(offset + 1:offset + count) = lower(k)%index(1:count)
+          j(offset + 1:offset + count) = k
+          v(offset + 1:offset + count) = lower(k)%value(1:count)
+          offset = offset + count
+       end do
+    end if
+    call L%init(A%grid, A%n)
+    if (A%is_complex()) then
+       call L%fill(i, j, v)
+    else
+       call L%fill(i, j, real(v, dp))
+    end if
+    if (A%is_single()) call msp_to_single(L)
+    if (A%on_device()) call msp_to_device(L)
+  end subroutine scatter
+
+  !> Append (index, value) to s.
+  subroutine append(s, index, value)
+    type(sparse_t), intent(inout) :: s
+    integer, intent(in) :: index
+    complex(dp), intent(in) :: value
+    integer, dimension(:), allocatable :: grown_index
+    complex(dp), dimension(:), allocatable :: grown_value
+
+    if (.not. allocated(s%index)) allocate(s%index(4), s%value(4))
+    if (s%count == size(s%index)) then
+       allocate(grown_index(2 * s%count), grown_value(2 * s%count))
+       grown_index(1:s%count) = s%index
+       grown_value(1:s%count) = s%value
+       call move_alloc(grown_index, s%index)
+       call move_alloc(grown_value, s%value)
+    end if
+    s%count = s%count + 1
+    s%index(s%count) = index
+    s%value(s%count) = value
+  end subroutine append
+end module msp_linear_mod

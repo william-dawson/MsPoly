@@ -1,0 +1,733 @@
+!> Dense eigendecompositions of Hermitian matrices, and matrix functions
+!> through them. The matrix moves to the block-cyclic layout of a dense
+!> solver on a near-square process grid over the ranks of the matrix grid:
+!> ScaLAPACK (p?syevd / p?heevd) on the CPU, cuSOLVERMp on the GPU. The
+!> dense solvers scale poorly on a single process row or column, so the
+!> shape of the matrix grid does not carry over.
+module msp_eigen_mod
+#:if defined('MSPOLY_CUSOLVERMP')
+  use, intrinsic :: iso_c_binding, only: c_int, c_int64_t, c_double, &
+       & c_double_complex, c_char
+  use mpi_f08, only: MPI_Comm, MPI_Bcast, MPI_CHARACTER, MPI_Comm_compare, &
+       & MPI_Comm_dup, MPI_Comm_free, MPI_IDENT, MPI_CONGRUENT
+#:endif
+  use mpi_f08, only: MPI_Alltoall, MPI_Alltoallv, MPI_INTEGER, &
+       & MPI_DOUBLE_COMPLEX
+  use msp_citations_mod, only: msp_cite
+  use msp_kinds_mod, only: dp
+  use msp_error_mod, only: msp_raise
+  use msp_dict_mod, only: msp_dict, msp_args, msp_info, copy
+  use msp_matrix_mod
+  implicit none
+  private
+
+  public :: msp_eigen, msp_dense_function, msp_scalar_function, eigen_impl, &
+       & dense_function_impl, eigen_compose, msp_dense_available, &
+       & msp_dense_release
+
+  abstract interface
+     !> A real function of a real argument, applied to the eigenvalues.
+     real(dp) function msp_scalar_function(x)
+       import :: dp
+       real(dp), intent(in) :: x
+     end function msp_scalar_function
+  end interface
+
+#:if defined('MSPOLY_SCALAPACK')
+  interface
+     integer function sys2blacs_handle(comm)
+       integer, intent(in) :: comm
+     end function sys2blacs_handle
+     subroutine free_blacs_system_handle(handle)
+       integer, intent(in) :: handle
+     end subroutine free_blacs_system_handle
+     subroutine blacs_gridinit(context, order, rows, cols)
+       integer, intent(inout) :: context
+       character, intent(in) :: order
+       integer, intent(in) :: rows, cols
+     end subroutine blacs_gridinit
+     subroutine blacs_gridexit(context)
+       integer, intent(in) :: context
+     end subroutine blacs_gridexit
+     subroutine descinit(desc, m, n, mb, nb, irsrc, icsrc, context, lld, &
+          & info)
+       integer, dimension(9), intent(out) :: desc
+       integer, intent(in) :: m, n, mb, nb, irsrc, icsrc, context, lld
+       integer, intent(out) :: info
+     end subroutine descinit
+     subroutine pdsyevd(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, &
+          & descz, work, lwork, iwork, liwork, info)
+       import :: dp
+       character, intent(in) :: jobz, uplo
+       integer, intent(in) :: n, ia, ja, iz, jz, lwork, liwork
+       real(dp), dimension(*), intent(inout) :: a
+       integer, dimension(9), intent(in) :: desca, descz
+       real(dp), dimension(*), intent(out) :: w, z, work
+       integer, dimension(*), intent(out) :: iwork
+       integer, intent(out) :: info
+     end subroutine pdsyevd
+     subroutine pdsyev(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, &
+          & descz, work, lwork, info)
+       import :: dp
+       character, intent(in) :: jobz, uplo
+       integer, intent(in) :: n, ia, ja, iz, jz, lwork
+       real(dp), dimension(*), intent(inout) :: a
+       integer, dimension(9), intent(in) :: desca, descz
+       real(dp), dimension(*), intent(out) :: w, z, work
+       integer, intent(out) :: info
+     end subroutine pdsyev
+     subroutine pzheev(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, &
+          & descz, work, lwork, rwork, lrwork, info)
+       import :: dp
+       character, intent(in) :: jobz, uplo
+       integer, intent(in) :: n, ia, ja, iz, jz, lwork, lrwork
+       complex(dp), dimension(*), intent(inout) :: a
+       integer, dimension(9), intent(in) :: desca, descz
+       real(dp), dimension(*), intent(out) :: w, rwork
+       complex(dp), dimension(*), intent(out) :: z, work
+       integer, intent(out) :: info
+     end subroutine pzheev
+     subroutine pzheevd(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, &
+          & descz, work, lwork, rwork, lrwork, iwork, liwork, info)
+       import :: dp
+       character, intent(in) :: jobz, uplo
+       integer, intent(in) :: n, ia, ja, iz, jz, lwork, lrwork, liwork
+       complex(dp), dimension(*), intent(inout) :: a
+       integer, dimension(9), intent(in) :: desca, descz
+       real(dp), dimension(*), intent(out) :: w, rwork
+       complex(dp), dimension(*), intent(out) :: z, work
+       integer, dimension(*), intent(out) :: iwork
+       integer, intent(out) :: info
+     end subroutine pzheevd
+  end interface
+#:endif
+#:if defined('MSPOLY_CUSOLVERMP')
+  interface
+     !> Fill id with a new NCCL unique id. Returns nonzero on failure.
+     integer(c_int) function cusolvermp_id(id) bind(c, name="msp_cusolvermp_id")
+       import :: c_int, c_char
+       character(kind=c_char), dimension(*), intent(out) :: id
+     end function cusolvermp_id
+     !> Open a context for rank of size ranks on a rows x cols process
+     !> grid, sharing the NCCL unique id; key identifies it. Returns nonzero
+     !> on failure.
+     integer(c_int) function cusolvermp_open(id, size, rank, rows, cols, &
+          & key) bind(c, name="msp_cusolvermp_open")
+       import :: c_int, c_char
+       character(kind=c_char), dimension(*), intent(in) :: id
+       integer(c_int), value :: size, rank, rows, cols
+       integer(c_int), intent(out) :: key
+     end function cusolvermp_open
+     subroutine cusolvermp_close(key) bind(c, name="msp_cusolvermp_close")
+       import :: c_int
+       integer(c_int), value :: key
+     end subroutine cusolvermp_close
+     !> Eigenvalues w (all n, ascending) and, when vectors is nonzero,
+     !> eigenvectors z of the Hermitian matrix a, both in the block-cyclic
+     !> layout with blocks of nb on the process grid of context key, on
+     !> host memory. Returns nonzero on failure, on every rank when it
+     !> fails on any rank before the solve.
+     integer(c_int) function cusolvermp_eigh_r(key, vectors, n, nb, lld, &
+          & local_cols, a, w, z) bind(c, name="msp_cusolvermp_eigh_r")
+       import :: c_int, c_int64_t, c_double
+       integer(c_int), value :: key, vectors, nb
+       integer(c_int64_t), value :: n, lld, local_cols
+       real(c_double), dimension(*), intent(in) :: a
+       real(c_double), dimension(*), intent(out) :: w, z
+     end function cusolvermp_eigh_r
+     integer(c_int) function cusolvermp_eigh_c(key, vectors, n, nb, lld, &
+          & local_cols, a, w, z) bind(c, name="msp_cusolvermp_eigh_c")
+       import :: c_int, c_int64_t, c_double, c_double_complex
+       integer(c_int), value :: key, vectors, nb
+       integer(c_int64_t), value :: n, lld, local_cols
+       complex(c_double_complex), dimension(*), intent(in) :: a
+       real(c_double), dimension(*), intent(out) :: w
+       complex(c_double_complex), dimension(*), intent(out) :: z
+     end function cusolvermp_eigh_c
+  end interface
+#:endif
+
+  !> The local part of an n x n matrix in the block-cyclic layout with
+  !> square blocks of nb on the nprow x npcol dense process grid, row-major
+  !> over the ranks of the matrix grid.
+  type :: cyclic_t
+     integer :: n = 0
+     integer :: nb = 1
+     integer :: nprow = 1
+     integer :: npcol = 1
+     integer :: prow = 0
+     integer :: pcol = 0
+     integer :: rows = 0
+     integer :: cols = 0
+     logical :: cplx = .false.
+     real(dp), dimension(:, :), allocatable :: ar, zr
+     complex(dp), dimension(:, :), allocatable :: ac, zc
+  end type cyclic_t
+#:if defined('MSPOLY_CUSOLVERMP')
+
+  !> An open cuSOLVERMp context for the process grid of comm (a duplicate)
+  !> with rows x cols processes.
+  type :: context_t
+     type(MPI_Comm) :: comm
+     integer :: rows = 0
+     integer :: cols = 0
+     integer(c_int) :: key = -1
+  end type context_t
+
+  type(context_t), dimension(:), allocatable, save :: contexts
+#:endif
+
+contains
+
+  !> Release what the dense backends keep between calls (the cuSOLVERMp
+  !> contexts). Collective over every grid used with them.
+  subroutine msp_dense_release()
+#:if defined('MSPOLY_CUSOLVERMP')
+    integer :: k
+
+    if (.not. allocated(contexts)) return
+    do k = 1, size(contexts)
+       call cusolvermp_close(contexts(k)%key)
+       call MPI_Comm_free(contexts(k)%comm)
+    end do
+    deallocate(contexts)
+#:endif
+  end subroutine msp_dense_release
+
+  !> Whether a dense backend is built in: "scalapack" or "cusolvermp".
+  logical function msp_dense_available(backend)
+    character(*), intent(in) :: backend
+
+    select case (backend)
+#:if defined('MSPOLY_SCALAPACK')
+    case ("scalapack")
+       msp_dense_available = .true.
+#:endif
+#:if defined('MSPOLY_CUSOLVERMP')
+    case ("cusolvermp")
+       msp_dense_available = .true.
+#:endif
+    case default
+       msp_dense_available = .false.
+    end select
+  end function msp_dense_available
+
+  !> The eigenvalues (ascending) and optionally eigenvectors of the
+  !> Hermitian matrix A. Collective. args and info as for eigen_impl.
+  subroutine msp_eigen(A, values, args, info, context, vectors)
+    type(msp_matrix), intent(in) :: A
+    real(dp), dimension(:), allocatable, intent(out) :: values
+    type(msp_dict), intent(in) :: args
+    type(msp_dict), intent(inout), target :: info
+    type(msp_dict), intent(in), target, optional :: context
+    type(msp_matrix), intent(inout), optional :: vectors
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call eigen_impl(A, values, a_args, r, vectors)
+    call a_args%finish(r)
+  end subroutine msp_eigen
+
+  !> B becomes f(A) = V f(D) V^H for the Hermitian A = V D V^H. Collective.
+  !> args and info as for dense_function_impl.
+  subroutine msp_dense_function(A, B, f, args, info, context)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: B
+    procedure(msp_scalar_function) :: f
+    type(msp_dict), intent(in) :: args
+    type(msp_dict), intent(inout), target :: info
+    type(msp_dict), intent(in), target, optional :: context
+    type(msp_dict), target :: tracked
+    type(msp_args) :: a_args
+    type(msp_info) :: r
+
+    call copy(tracked, args)
+    call a_args%open(tracked, context)
+    call r%open(info)
+    call dense_function_impl(A, B, f, a_args, r)
+    call a_args%finish(r)
+  end subroutine msp_dense_function
+
+  !> All eigenvalues of A, of which values keeps the nvals lowest; vectors
+  !> gets the matching eigenvectors as its first nvals columns (the rest are
+  !> zero), with the kind, precision and location of A, entries of
+  !> magnitude at most threshold dropped. Arithmetic is in double precision.
+  !>
+  !> args: nvals (default n), threshold (scoped, default 0), backend
+  !> (scoped; "scalapack" or "cusolvermp"; default cusolvermp for a matrix
+  !> on the GPU when built in, else scalapack), block (scoped, default 64;
+  !> smaller when needed so that every process row and column holds a
+  !> block).
+  !> info: backend, block.
+  subroutine eigen_impl(A, values, args, info, vectors)
+    type(msp_matrix), intent(in) :: A
+    real(dp), dimension(:), allocatable, intent(out) :: values
+    type(msp_args), intent(in) :: args
+    type(msp_info), intent(in) :: info
+    type(msp_matrix), intent(inout), optional :: vectors
+    character(:), allocatable :: backend
+    real(dp) :: threshold
+    integer :: nvals, block
+
+    call args%get("nvals", nvals, default=A%n)
+    call read_solver(A, args, threshold, backend, block)
+    call decompose(A, backend, block, max(0, min(nvals, A%n)), threshold, &
+         & values, info, vectors)
+  end subroutine eigen_impl
+
+  !> V f(D) V^H from the eigendecomposition A = V D V^H, with the kind,
+  !> precision and location of A. A second function f2 gives B2 from the
+  !> same decomposition.
+  !>
+  !> domain says where the eigenvalues must lie, up to rounding (n times
+  !> epsilon times the largest magnitude): "positive", "nonnegative" or
+  !> "nonzero". Others are an error that names the offending eigenvalue.
+  !>
+  !> args: threshold (scoped, default 0; for the eigenvectors and the
+  !> product), backend and block as for eigen_impl.
+  !> info: backend, block.
+  subroutine dense_function_impl(A, B, f, args, info, domain, B2, f2)
+    type(msp_matrix), intent(in) :: A
+    type(msp_matrix), intent(inout) :: B
+    procedure(msp_scalar_function) :: f
+    type(msp_args), intent(in) :: args
+    type(msp_info), intent(in) :: info
+    character(*), intent(in), optional :: domain
+    type(msp_matrix), intent(inout), optional :: B2
+    procedure(msp_scalar_function), optional :: f2
+    type(msp_matrix) :: v
+    character(:), allocatable :: backend
+    real(dp), dimension(:), allocatable :: values
+    real(dp) :: threshold
+    integer :: block, q
+
+    call read_solver(A, args, threshold, backend, block)
+    call msp_cite("higham2008functions", info)
+    call decompose(A, backend, block, A%n, threshold, values, info, v)
+    if (present(domain)) call check_domain(values, domain)
+    call eigen_compose(v, [(f(values(q)), q = 1, A%n)], B, threshold)
+    if (present(B2) .and. present(f2)) &
+         & call eigen_compose(v, [(f2(values(q)), q = 1, A%n)], B2, threshold)
+    call v%free()
+  end subroutine dense_function_impl
+
+  !> Raises an error when an eigenvalue lies outside the domain.
+  subroutine check_domain(values, domain)
+    real(dp), dimension(:), intent(in) :: values
+    character(*), intent(in) :: domain
+    real(dp) :: tol
+    integer :: q
+    logical :: bad
+
+    tol = size(values) * epsilon(1.0_dp) * maxval(abs(values))
+    do q = 1, size(values)
+       select case (domain)
+       case ("positive")
+          bad = values(q) <= tol
+       case ("nonnegative")
+          bad = values(q) < -tol
+       case default
+          bad = abs(values(q)) <= tol
+       end select
+       if (bad) call msp_raise("msp_dense_function: eigenvalue " // &
+            & real_str(values(q)) // " of the matrix is not " // domain)
+    end do
+  end subroutine check_domain
+
+  function real_str(x) result(s)
+    real(dp), intent(in) :: x
+    character(:), allocatable :: s
+    character(len=24) :: buffer
+
+    write(buffer, '(es15.6)') x
+    s = trim(adjustl(buffer))
+  end function real_str
+
+  !> B becomes V diag(weights) V^H, with the kind, precision and location of
+  !> V, entries of magnitude at most threshold dropped. Collective.
+  subroutine eigen_compose(V, weights, B, threshold)
+    type(msp_matrix), intent(in) :: V
+    real(dp), dimension(:), intent(in) :: weights
+    type(msp_matrix), intent(inout) :: B
+    real(dp), intent(in) :: threshold
+    type(msp_matrix) :: d, scaled, vh
+    integer, dimension(:), allocatable :: diagonal
+    integer :: q
+
+    !! Each rank contributes its share of the diagonal.
+    diagonal = [(q, q = V%grid%rank + 1, V%n, V%grid%size)]
+    call d%init(V%grid, V%n)
+    call d%fill(diagonal, diagonal, weights(diagonal))
+    if (V%is_single()) call msp_to_single(d)
+    if (V%on_device()) call msp_to_device(d)
+    call msp_multiply(V, d, scaled)
+    call msp_transpose(V, vh, conjugate=.true.)
+    call msp_multiply(scaled, vh, B, threshold=threshold)
+    call d%free()
+    call scaled%free()
+    call vh%free()
+  end subroutine eigen_compose
+
+  !> The parameters of the dense solver, as described for eigen_impl.
+  subroutine read_solver(A, args, threshold, backend, block)
+    type(msp_matrix), intent(in) :: A
+    type(msp_args), intent(in) :: args
+    real(dp), intent(out) :: threshold
+    character(:), allocatable, intent(out) :: backend
+    integer, intent(out) :: block
+    integer :: nprow, npcol
+
+    call args%get("threshold", threshold, default=0.0_dp, scoped=.true.)
+    call args%get("backend", backend, default=default_backend(A), &
+         & scoped=.true.)
+    call args%get("block", block, default=64, scoped=.true.)
+    if (.not. msp_dense_available(backend)) call msp_raise("msp_eigen: " // &
+         & "backend '" // backend // "' is not built in")
+    call process_shape(A%grid%size, nprow, npcol)
+    block = max(1, min(block, A%n / max(nprow, npcol)))
+  end subroutine read_solver
+
+  !> The most square nprow x npcol, nprow <= npcol, with nprow * npcol =
+  !> size.
+  pure subroutine process_shape(size, nprow, npcol)
+    integer, intent(in) :: size
+    integer, intent(out) :: nprow, npcol
+
+    nprow = int(sqrt(real(size)))
+    do while (mod(size, nprow) /= 0)
+       nprow = nprow - 1
+    end do
+    npcol = size / nprow
+  end subroutine process_shape
+
+  !> values and vectors as described for eigen_impl. Collective.
+  subroutine decompose(A, backend, block, nvals, threshold, values, info, &
+       & vectors)
+    type(msp_matrix), intent(in) :: A
+    character(*), intent(in) :: backend
+    integer, intent(in) :: block, nvals
+    real(dp), intent(in) :: threshold
+    real(dp), dimension(:), allocatable, intent(out) :: values
+    type(msp_info), intent(in) :: info
+    type(msp_matrix), intent(inout), optional :: vectors
+    type(cyclic_t) :: c
+    real(dp), dimension(:), allocatable :: w
+
+    call info%set("backend", backend)
+    call info%set("block", block)
+    call to_cyclic(A, block, c)
+    allocate(w(A%n))
+    select case (backend)
+#:if defined('MSPOLY_SCALAPACK')
+    case ("scalapack")
+       call msp_cite("blackford1997scalapack", info)
+       call scalapack_eigh(A, c, w, present(vectors))
+#:endif
+#:if defined('MSPOLY_CUSOLVERMP')
+    case ("cusolvermp")
+       call msp_cite("nvidia_cusolvermp", info)
+       call cusolvermp_eigh(A, c, w, present(vectors))
+#:endif
+    end select
+    values = w(1:nvals)
+    if (present(vectors)) call from_cyclic(A, c, nvals, threshold, vectors)
+  end subroutine decompose
+
+  !> The backend used when args name none.
+  function default_backend(A) result(backend)
+    type(msp_matrix), intent(in) :: A
+    character(:), allocatable :: backend
+
+    backend = "scalapack"
+    if (A%on_device() .and. msp_dense_available("cusolvermp")) &
+         & backend = "cusolvermp"
+  end function default_backend
+
+  !> The number of the n indices in blocks of nb that coordinate p of a
+  !> dimension with np processes owns (ScaLAPACK's NUMROC, source 0).
+  pure integer function owned(n, nb, p, np)
+    integer, intent(in) :: n, nb, p, np
+    integer :: blocks
+
+    blocks = n / nb
+    owned = (blocks / np) * nb
+    if (mod(blocks, np) > p) then
+       owned = owned + nb
+    else if (mod(blocks, np) == p) then
+       owned = owned + mod(n, nb)
+    end if
+  end function owned
+
+  !> The process coordinate that owns global index g (1-based).
+  pure integer function owner(g, nb, np)
+    integer, intent(in) :: g, nb, np
+
+    owner = mod((g - 1) / nb, np)
+  end function owner
+
+  !> The local index of global index g on its owner.
+  pure integer function local(g, nb, np)
+    integer, intent(in) :: g, nb, np
+
+    local = ((g - 1) / (nb * np)) * nb + mod(g - 1, nb) + 1
+  end function local
+
+  !> The global index of local index l on process coordinate p.
+  pure integer function global(l, nb, p, np)
+    integer, intent(in) :: l, nb, p, np
+
+    global = (((l - 1) / nb) * np + p) * nb + mod(l - 1, nb) + 1
+  end function global
+
+  !> c becomes A in the block-cyclic layout with blocks of nb, in double
+  !> precision. Collective.
+  subroutine to_cyclic(A, nb, c)
+    type(msp_matrix), intent(in) :: A
+    integer, intent(in) :: nb
+    type(cyclic_t), intent(out) :: c
+    integer, dimension(:), allocatable :: i, j, dest, order, send_n, recv_n, &
+         & send_at, recv_at, ri, rj
+    complex(dp), dimension(:), allocatable :: v, rv
+    integer :: np, p, k
+    integer, dimension(:), allocatable :: next
+
+    c%n = A%n
+    c%nb = nb
+    c%cplx = A%is_complex()
+    call process_shape(A%grid%size, c%nprow, c%npcol)
+    c%prow = A%grid%rank / c%npcol
+    c%pcol = mod(A%grid%rank, c%npcol)
+    c%rows = owned(A%n, nb, c%prow, c%nprow)
+    c%cols = owned(A%n, nb, c%pcol, c%npcol)
+    call A%entries(i, j, v)
+    np = A%grid%size
+    allocate(dest(size(i)))
+    do k = 1, size(i)
+       dest(k) = owner(i(k), nb, c%nprow) * c%npcol + &
+            & owner(j(k), nb, c%npcol)
+    end do
+    allocate(send_n(0:np - 1), recv_n(0:np - 1), next(0:np - 1))
+    send_n = 0
+    do k = 1, size(i)
+       send_n(dest(k)) = send_n(dest(k)) + 1
+    end do
+    call MPI_Alltoall(send_n, 1, MPI_INTEGER, recv_n, 1, MPI_INTEGER, &
+         & A%grid%comm)
+    send_at = [0, (sum(send_n(0:p - 1)), p = 1, np - 1)]
+    recv_at = [0, (sum(recv_n(0:p - 1)), p = 1, np - 1)]
+    allocate(order(size(i)))
+    next = send_at
+    do k = 1, size(i)
+       next(dest(k)) = next(dest(k)) + 1
+       order(next(dest(k))) = k
+    end do
+    i = i(order)
+    j = j(order)
+    v = v(order)
+    allocate(ri(sum(recv_n)), rj(sum(recv_n)), rv(sum(recv_n)))
+    call MPI_Alltoallv(i, send_n, send_at, MPI_INTEGER, ri, recv_n, &
+         & recv_at, MPI_INTEGER, A%grid%comm)
+    call MPI_Alltoallv(j, send_n, send_at, MPI_INTEGER, rj, recv_n, &
+         & recv_at, MPI_INTEGER, A%grid%comm)
+    call MPI_Alltoallv(v, send_n, send_at, MPI_DOUBLE_COMPLEX, rv, recv_n, &
+         & recv_at, MPI_DOUBLE_COMPLEX, A%grid%comm)
+    if (c%cplx) then
+       allocate(c%ac(max(1, c%rows), max(1, c%cols)))
+       c%ac = 0
+       do k = 1, size(ri)
+          c%ac(local(ri(k), nb, c%nprow), local(rj(k), nb, c%npcol)) = &
+               & rv(k)
+       end do
+    else
+       allocate(c%ar(max(1, c%rows), max(1, c%cols)))
+       c%ar = 0
+       do k = 1, size(ri)
+          c%ar(local(ri(k), nb, c%nprow), local(rj(k), nb, c%npcol)) = &
+               & real(rv(k), dp)
+       end do
+    end if
+  end subroutine to_cyclic
+
+  !> V becomes the first nvals columns of the eigenvectors in c, entries of
+  !> magnitude at most threshold dropped, with the kind, precision and
+  !> location of A. Collective.
+  subroutine from_cyclic(A, c, nvals, threshold, V)
+    type(msp_matrix), intent(in) :: A
+    type(cyclic_t), intent(in) :: c
+    integer, intent(in) :: nvals
+    real(dp), intent(in) :: threshold
+    type(msp_matrix), intent(inout) :: V
+    integer, dimension(:), allocatable :: i, j
+    complex(dp), dimension(:), allocatable :: x
+    integer :: p, q, gj, kept
+
+    allocate(i(c%rows * c%cols), j(c%rows * c%cols), x(c%rows * c%cols))
+    kept = 0
+    do q = 1, c%cols
+       gj = global(q, c%nb, c%pcol, c%npcol)
+       if (gj > nvals) cycle
+       do p = 1, c%rows
+          kept = kept + 1
+          i(kept) = global(p, c%nb, c%prow, c%nprow)
+          j(kept) = gj
+          if (c%cplx) then
+             x(kept) = c%zc(p, q)
+          else
+             x(kept) = c%zr(p, q)
+          end if
+          if (abs(x(kept)) <= threshold) kept = kept - 1
+       end do
+    end do
+    call V%init(A%grid, A%n)
+    if (c%cplx) then
+       call V%fill(i(1:kept), j(1:kept), x(1:kept))
+    else
+       call V%fill(i(1:kept), j(1:kept), real(x(1:kept), dp))
+    end if
+    if (A%is_single()) call msp_to_single(V)
+    if (A%on_device()) call msp_to_device(V)
+  end subroutine from_cyclic
+
+#:if defined('MSPOLY_SCALAPACK')
+  !> w and the eigenvectors in c from ScaLAPACK's divide and conquer
+  !> solver, or w alone from its eigenvalue-only solver (p?syevd and
+  !> p?heevd accept only jobz = 'V'), when the eigenvectors are not wanted.
+  !> Collective.
+  subroutine scalapack_eigh(A, c, w, wanted)
+    type(msp_matrix), intent(in) :: A
+    type(cyclic_t), intent(inout) :: c
+    real(dp), dimension(:), intent(out) :: w
+    logical, intent(in) :: wanted
+    integer, dimension(9) :: desc
+    real(dp), dimension(:), allocatable :: work, rwork
+    complex(dp), dimension(:), allocatable :: cwork
+    integer, dimension(:), allocatable :: iwork
+    real(dp), dimension(1) :: query
+    complex(dp), dimension(1) :: cquery
+    integer, dimension(1) :: iquery
+    real(dp), dimension(1, 1) :: unused
+    complex(dp), dimension(1, 1) :: cunused
+    integer :: handle, context, status, back
+
+    !! The back transformation (p?ormtr / p?unmtr) needs at least back
+    !! words, which the query for the whole solver can fall short of.
+    back = max(c%nb * (c%nb - 1) / 2, (c%rows + c%cols) * c%nb) + c%nb**2
+    handle = sys2blacs_handle(A%grid%comm%MPI_VAL)
+    context = handle
+    call blacs_gridinit(context, 'R', c%nprow, c%npcol)
+    call descinit(desc, c%n, c%n, c%nb, c%nb, 0, 0, context, &
+         & max(1, c%rows), status)
+    if (c%cplx .and. wanted) then
+       allocate(c%zc, mold=c%ac)
+       call pzheevd('V', 'L', c%n, c%ac, 1, 1, desc, w, c%zc, 1, 1, desc, &
+            & cquery, -1, query, -1, iquery, -1, status)
+       allocate(cwork(int(real(cquery(1), dp)) + back), rwork(int(query(1))), &
+            & iwork(iquery(1)))
+       call pzheevd('V', 'L', c%n, c%ac, 1, 1, desc, w, c%zc, 1, 1, desc, &
+            & cwork, size(cwork), rwork, size(rwork), iwork, size(iwork), &
+            & status)
+    else if (c%cplx) then
+       call pzheev('N', 'L', c%n, c%ac, 1, 1, desc, w, cunused, 1, 1, desc, &
+            & cquery, -1, query, -1, status)
+       allocate(cwork(int(real(cquery(1), dp))), rwork(int(query(1))))
+       call pzheev('N', 'L', c%n, c%ac, 1, 1, desc, w, cunused, 1, 1, desc, &
+            & cwork, size(cwork), rwork, size(rwork), status)
+    else if (wanted) then
+       allocate(c%zr, mold=c%ar)
+       call pdsyevd('V', 'L', c%n, c%ar, 1, 1, desc, w, c%zr, 1, 1, desc, &
+            & query, -1, iquery, -1, status)
+       allocate(work(int(query(1)) + back), iwork(iquery(1)))
+       call pdsyevd('V', 'L', c%n, c%ar, 1, 1, desc, w, c%zr, 1, 1, desc, &
+            & work, size(work), iwork, size(iwork), status)
+    else
+       call pdsyev('N', 'L', c%n, c%ar, 1, 1, desc, w, unused, 1, 1, desc, &
+            & query, -1, status)
+       allocate(work(int(query(1))))
+       call pdsyev('N', 'L', c%n, c%ar, 1, 1, desc, w, unused, 1, 1, desc, &
+            & work, size(work), status)
+    end if
+    call blacs_gridexit(context)
+    call free_blacs_system_handle(handle)
+    if (status /= 0) call msp_raise("msp_eigen: ScaLAPACK failed")
+  end subroutine scalapack_eigh
+#:endif
+
+#:if defined('MSPOLY_CUSOLVERMP')
+  !> w, and the eigenvectors in c when wanted, from cuSOLVERMp's divide
+  !> and conquer solver on the GPUs. Collective.
+  subroutine cusolvermp_eigh(A, c, w, wanted)
+    type(msp_matrix), intent(in) :: A
+    type(cyclic_t), intent(inout) :: c
+    real(dp), dimension(:), intent(out) :: w
+    logical, intent(in) :: wanted
+    type(msp_dict) :: err
+    integer(c_int) :: key, vectors
+    integer :: status
+
+    key = context(A, c)
+    vectors = merge(1, 0, wanted)
+    if (c%cplx) then
+       allocate(c%zc(merge(size(c%ac, 1), 1, wanted), &
+            & merge(size(c%ac, 2), 1, wanted)))
+       status = cusolvermp_eigh_c(key, vectors, int(c%n, c_int64_t), c%nb, &
+            & int(size(c%ac, 1), c_int64_t), int(c%cols, c_int64_t), c%ac, &
+            & w, c%zc)
+    else
+       allocate(c%zr(merge(size(c%ar, 1), 1, wanted), &
+            & merge(size(c%ar, 2), 1, wanted)))
+       status = cusolvermp_eigh_r(key, vectors, int(c%n, c_int64_t), c%nb, &
+            & int(size(c%ar, 1), c_int64_t), int(c%cols, c_int64_t), c%ar, &
+            & w, c%zr)
+    end if
+    if (status /= 0) call err%set("message", "msp_eigen: cuSOLVERMp failed")
+    call A%grid%agree(err)
+  end subroutine cusolvermp_eigh
+
+  !> The key of the cuSOLVERMp context for the grid of A, opened on first
+  !> use. Collective.
+  integer(c_int) function context(A, c) result(key)
+    type(msp_matrix), intent(in) :: A
+    type(cyclic_t), intent(in) :: c
+    !! NCCL_UNIQUE_ID_BYTES
+    character(kind=c_char), dimension(128) :: id
+    type(context_t) :: new
+    type(msp_dict) :: err
+    character(:), allocatable :: errmsg
+    integer :: k, relation, status, stat
+
+    if (.not. allocated(contexts)) allocate(contexts(0))
+    do k = 1, size(contexts)
+       if (contexts(k)%rows /= c%nprow .or. contexts(k)%cols /= c%npcol) &
+            & cycle
+       call MPI_Comm_compare(contexts(k)%comm, A%grid%comm, relation)
+       if (relation == MPI_IDENT .or. relation == MPI_CONGRUENT) then
+          key = contexts(k)%key
+          return
+       end if
+    end do
+    status = 0
+    if (A%grid%rank == 0) status = cusolvermp_id(id)
+    call MPI_Bcast(status, 1, MPI_INTEGER, 0, A%grid%comm)
+    if (status /= 0) call msp_raise("msp_eigen: cannot create an NCCL id")
+    call MPI_Bcast(id, size(id), MPI_CHARACTER, 0, A%grid%comm)
+    status = cusolvermp_open(id, A%grid%size, A%grid%rank, c%nprow, &
+         & c%npcol, new%key)
+    if (status /= 0) call err%set("message", "msp_eigen: cannot open " // &
+         & "a cuSOLVERMp context")
+    call A%grid%agree(err, stat, errmsg)
+    if (stat /= 0) then
+       if (status == 0) call cusolvermp_close(new%key)
+       call msp_raise(errmsg)
+    end if
+    call MPI_Comm_dup(A%grid%comm, new%comm)
+    new%rows = c%nprow
+    new%cols = c%npcol
+    contexts = [contexts, new]
+    key = new%key
+  end function context
+#:endif
+end module msp_eigen_mod

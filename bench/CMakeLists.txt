@@ -1,0 +1,5 @@
+foreach(name bench_multiply bench_density bench_eigen bench_cholesky make_filled)
+  add_executable(${name} ${name}.f90)
+  target_link_libraries(${name} PRIVATE MsPoly::solvers)
+  msp_target_flags(${name})
+endforeach()

@@ -1,0 +1,198 @@
+#### nvfortran26.3 [-O0] nvfortran 26.3-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.3 [-O2] nvfortran 26.3-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: FAIL (expected ' 1.50 2.50') exit=1  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.3 [-O0 -Mstandard] nvfortran 26.3-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  [NVFORTRAN-W-0155-Mismatched data type for member used (../r4_structure_constructor.f90: 22)]
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.5 [-O0] nvfortran 26.5-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.5 [-O2] nvfortran 26.5-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: FAIL (expected ' 1.50 2.50') exit=1  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.5 [-O0 -Mstandard] nvfortran 26.5-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  [NVFORTRAN-W-0155-Mismatched data type for member used (../r4_structure_constructor.f90: 22)]
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.9 [-O0] nvfortran 26.9-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.9 [-O2] nvfortran 26.9-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  
+  r5_typed_element_to_class_star: RESULT: FAIL (expected ' 1.50 2.50') exit=1  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### nvfortran26.9 [-O0 -Mstandard] nvfortran 26.9-0 linuxarm64 target on aarch64 Linux -tp neoverse-v2 
+  r1_array_element_assignment: allocatable array element = scalar          FAIL: value is  0.000E+00 RESULT: 1 failure(s) exit=1  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: COMPILE ERROR: NVFORTRAN-S-0074-Illegal number or type of arguments to move_alloc - keyword argument to (../r2a_move_alloc_local.f90: 8
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3a_source_typed_constructor_poly.f90: 6)
+  r3b_source_typed_constructor_plain: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3b_source_typed_constructor_plain.f90: 5)
+  r3c_source_typed_constructor_char: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3c_source_typed_constructor_char.f90: 5)
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: COMPILE ERROR: NVFORTRAN-S-0034-Syntax error at or near = (../r3e_mold_typed_constructor.f90: 5)
+  r4_structure_constructor: RESULT: 1 failure(s) exit=1  [NVFORTRAN-W-0155-Mismatched data type for member used (../r4_structure_constructor.f90: 22)]
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: FAIL (expected [l1.l2.l3.l4] len=11) exit=1  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: FAIL (ACHAR result must have length 1) exit=1  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### gfortran13 [-O0 -std=f2018] GNU Fortran (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+  r1_array_element_assignment: RESULT: all passed exit=0  
+  r1b_array_element_assignment_class: RESULT: all passed exit=0  
+  r2a_move_alloc_local: RESULT: all passed exit=0  
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: RESULT: all passed exit=0  
+  r3b_source_typed_constructor_plain: RESULT: all passed exit=0  
+  r3c_source_typed_constructor_char: RESULT: all passed exit=0  
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: RESULT: all passed exit=0  
+  r4_structure_constructor: RESULT: all passed exit=0  
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: all passed exit=0  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: all passed exit=0  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
+#### gfortran13 [-O2 -std=f2018] GNU Fortran (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+  r1_array_element_assignment: RESULT: all passed exit=0  
+  r1b_array_element_assignment_class: RESULT: FAIL (allocatable array element = scalar) exit=1  
+  r2a_move_alloc_local: RESULT: all passed exit=0  
+  r2b_move_alloc_scalar: RESULT: all passed exit=0  
+  r2c_move_alloc_component: RESULT: all passed exit=0  
+  r3a_source_typed_constructor_poly: RESULT: all passed exit=0  
+  r3b_source_typed_constructor_plain: RESULT: all passed exit=0  
+  r3c_source_typed_constructor_char: RESULT: all passed exit=0  
+  r3d_source_untyped_constructor: RESULT: all passed exit=0  
+  r3e_mold_typed_constructor: RESULT: all passed exit=0  
+  r4_structure_constructor: RESULT: all passed exit=0  
+  r5_typed_element_to_class_star: RESULT: all passed exit=0  
+  r6_deferred_length_self_concat: RESULT: all passed exit=0  
+  r6b_deferred_length_self_concat_char: RESULT: all passed exit=0  
+  r6c_achar_length: RESULT: all passed exit=0  
+  r7_mchkptr_zero_size: RESULT: all passed exit=0  
+  r7b_mchkptr_type_bound: RESULT: all passed exit=0  
