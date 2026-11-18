@@ -32,10 +32,8 @@ The options are:
 
 * `-DMSPOLY_SCALAPACK_LIBRARIES=` the libraries to link for ScaLAPACK (default
   `scalapack`; separate libraries go in a `;` separated list).
-* `-DMSPOLY_GPU=ON` to compute on NVIDIA GPUs (the matrices must be in
-  memory that both CPU and GPU can reach, as on Grace-Hopper and Grace-
-  Blackwell systems). Point `CMAKE_PREFIX_PATH` at cuSOLVERMp and NCCL if they
-  are not in a default location.
+* `-DMSPOLY_GPU=ON` to compute on NVIDIA GPUs. Point `CMAKE_PREFIX_PATH` at
+  cuSOLVERMp and NCCL if they are not in a default location.
 * `-DMSPOLY_BUILD_BENCH=ON` to build the benchmark programs in `bench`.
 
 The libraries are `mspoly_solvers`, `mspoly_matrix` and `mspoly_utils`; link
@@ -90,7 +88,6 @@ program example
   call args%set("trace", 100.0_dp)
   call args%set("method", "trs4")
   call args%set("threshold", 1.0e-8_dp)
-  call args%set("tolerence", 1.0e-6_dp)   ! a typo
   call msp_density(h, density, args, info)
   call grid%log(info)
 
@@ -125,14 +122,11 @@ converged: true
 energy: 7.30381231829969977E+001
 iterations: 16
 stop: "tolerance"
-unused_arguments: ["tolerence"]
 ```
 
-A misspelled or misplaced keyword is not an error, but it is reported as
-`unused_arguments`, so mistakes do not pass silently. Inside a program, read
-the same report with `info%get_logical("converged")`, `info%get_real("energy")`
-and so on. To move the calculation to the GPU, move the input with
-`msp_to_device(h)`; nothing else changes.
+Inside a program, read the same report with `info%get_logical("converged")`,
+`info%get_real("energy")` and so on. To move the calculation to the GPU, move
+the input with `msp_to_device(h)`; nothing else changes.
 
 Feature Outline
 --------------------------------------------------------------------------------
