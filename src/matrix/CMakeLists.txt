@@ -13,6 +13,8 @@ set_target_properties(mspoly_matrix PROPERTIES
 target_link_libraries(mspoly_matrix PUBLIC MsPoly::utils OpenMP::OpenMP_Fortran)
 if(MSPOLY_GPU)
   msp_fypp(gpu_generated msp_gpu_csr_mod.fypp)
-  target_sources(mspoly_matrix PRIVATE ${gpu_generated} msp_gpu_kernels.cu)
-  target_link_libraries(mspoly_matrix PUBLIC CUDA::cudart stdc++)
+  target_sources(mspoly_matrix PRIVATE ${gpu_generated} msp_gpu_kernels.cu
+    msp_gpu_nccl.cu)
+  target_include_directories(mspoly_matrix PRIVATE ${NCCL_INCLUDE_DIR})
+  target_link_libraries(mspoly_matrix PUBLIC CUDA::cudart ${NCCL_LIBRARY} stdc++)
 endif()
