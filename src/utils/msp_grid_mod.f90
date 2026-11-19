@@ -4,7 +4,7 @@ module msp_grid_mod
   use mpi_f08, only: MPI_Comm, MPI_COMM_NULL, MPI_INTEGER, MPI_BYTE, &
        & MPI_SUM, MPI_MIN, MPI_Comm_dup, MPI_Comm_split, MPI_Comm_free, &
        & MPI_Comm_rank, MPI_Comm_size, MPI_Allreduce, MPI_Bcast, &
-       & MPI_Finalized, MPI_IN_PLACE, operator(/=)
+       & MPI_Finalized, MPI_IN_PLACE
   use msp_error_mod, only: msp_raise, msp_clear
   use msp_dict_mod, only: msp_dict
   implicit none
@@ -106,9 +106,9 @@ contains
 
     call MPI_Finalized(finalized)
     if (.not. finalized) then
-       if (this%row_comm /= MPI_COMM_NULL) call MPI_Comm_free(this%row_comm)
-       if (this%col_comm /= MPI_COMM_NULL) call MPI_Comm_free(this%col_comm)
-       if (this%comm /= MPI_COMM_NULL) call MPI_Comm_free(this%comm)
+       if (this%row_comm%MPI_VAL /= MPI_COMM_NULL%MPI_VAL) call MPI_Comm_free(this%row_comm)
+       if (this%col_comm%MPI_VAL /= MPI_COMM_NULL%MPI_VAL) call MPI_Comm_free(this%col_comm)
+       if (this%comm%MPI_VAL /= MPI_COMM_NULL%MPI_VAL) call MPI_Comm_free(this%comm)
     end if
     this%row_comm = MPI_COMM_NULL
     this%col_comm = MPI_COMM_NULL
