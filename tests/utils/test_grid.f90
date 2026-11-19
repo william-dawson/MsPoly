@@ -2,8 +2,7 @@
 !> and logging. Run on 1, 2 and 4 ranks.
 program test_grid
   use mpi_f08, only: MPI_Init, MPI_Finalize, MPI_COMM_WORLD, MPI_COMM_NULL, &
-       & MPI_Comm_size, MPI_Comm_rank, MPI_Bcast, MPI_INTEGER8, &
-       & operator(==)
+       & MPI_Comm_size, MPI_Comm_rank, MPI_Bcast, MPI_INTEGER8
   use msp_kinds_mod, only: dp, i64
   use msp_dict_mod
   use msp_grid_mod
@@ -136,7 +135,7 @@ contains
     call g%init(MPI_COMM_WORLD)
     call g%free()
     call g%free()
-    call check(g%comm == MPI_COMM_NULL .and. g%size == 1, &
+    call check(g%comm%MPI_VAL == MPI_COMM_NULL%MPI_VAL .and. g%size == 1, &
          & "free releases the grid and can be repeated")
     call g%init(MPI_COMM_WORLD)
     call check(g%size == nranks, "a freed grid can be built again")
