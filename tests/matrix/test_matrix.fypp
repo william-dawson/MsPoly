@@ -158,6 +158,36 @@ contains
     if (device) call msp_to_device(m)
   end subroutine make_${k}$
 
+  !> Every rank passes only the entries of its own block (no communication
+  !! needed), in an order that leaves the columns of a row unsorted, and
+  !! each entry as two halves.
+  subroutine make_owned_${k}$(m, d)
+    type(msp_matrix), intent(inout) :: m
+    complex(dp), dimension(n, n), intent(in) :: d
+    integer, dimension(2 * n * n) :: i, j
+    ${ty}$, dimension(2 * n * n) :: v
+    integer :: p, q, mine, half
+    complex(dp) :: x
+
+    call m%init(grid, n)
+    mine = 0
+    do half = 1, 2
+       do q = m%col0 + m%cols, m%col0 + 1, -1
+          do p = m%row0 + 1, m%row0 + m%rows
+             if (d(p, q) == 0) cycle
+             x = d(p, q) / 2
+             mine = mine + 1
+             i(mine) = p
+             j(mine) = q
+             v(mine) = ${conv}$
+          end do
+       end do
+    end do
+    call m%fill(i(1:mine), j(1:mine), v(1:mine))
+    if (single) call msp_to_single(m)
+    if (device) call msp_to_device(m)
+  end subroutine make_owned_${k}$
+
   subroutine test_${k}$()
     type(msp_matrix) :: a, b, c, t, id
     complex(dp), dimension(n, n) :: da, db, dc
@@ -172,6 +202,9 @@ contains
     call make_${k}$(a, da)
     call check(error(a, da) < tol .and. a%nnz() == count(da /= 0), &
          & tag // "${k}$: fill from all ranks with duplicates")
+    call make_owned_${k}$(c, da)
+    call check(error(c, da) < tol .and. c%nnz() == count(da /= 0), &
+         & tag // "${k}$: fill with the entries of the own block")
     call check(a%is_complex() .eqv. cplx, &
          & tag // "${k}$: kind follows the values")
     call check(a%on_device() .eqv. device, tag // "${k}$: location")

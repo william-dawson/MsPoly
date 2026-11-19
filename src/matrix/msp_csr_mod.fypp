@@ -64,6 +64,21 @@ module msp_csr_mod
 #:endfor
 contains
 
+  !> Whether the columns are already in ascending order (entries that come in
+  !> the order of a column major traversal, say, produce rows that are).
+  pure logical function ascending(col)
+    integer, dimension(:), intent(in) :: col
+    integer :: p
+
+    ascending = .true.
+    do p = 2, size(col)
+       if (col(p) < col(p - 1)) then
+          ascending = .false.
+          return
+       end if
+    end do
+  end function ascending
+
 #:for k, ty, mpit, cplx, single, acc, narrow, wide in KINDS
   #:if single == '.false.'
   !> Build from local triplets (1-based local indices). Duplicates are summed.
@@ -100,7 +115,8 @@ contains
     w = 0
     do r = 1, rows
        first = this%row_ptr(r)
-       call sort_${k}$(this%col(first:this%row_ptr(r + 1) - 1), &
+       if (.not. ascending(this%col(first:this%row_ptr(r + 1) - 1))) &
+            & call sort_${k}$(this%col(first:this%row_ptr(r + 1) - 1), &
             & this%val(first:this%row_ptr(r + 1) - 1))
        this%row_ptr(r) = w + 1
        do p = first, this%row_ptr(r + 1) - 1

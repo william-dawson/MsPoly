@@ -266,7 +266,7 @@ contains
     integer, dimension(:), allocatable :: dest, order, send_n, recv_n, &
          & send_at, recv_at, si, sj, ri, rj
     ${ty}$, dimension(:), allocatable :: sv, rv
-    integer :: p, k, np
+    integer :: p, k, np, abroad
 
     call msp_clear(stat)
     if (size(i) /= size(j) .or. size(i) /= size(v)) then
@@ -278,11 +278,26 @@ contains
     call this%grid%agree(err, stat, errmsg)
     if (err%num_keys() > 0) return
 
+    !! When every rank only passes entries of its own block, which is what
+    !! a caller that already holds the matrix in the layout of the grid does,
+    !! nothing has to move.
+    abroad = merge(0, 1, all(i > this%row0 .and. i <= this%row0 + this%rows &
+         & .and. j > this%col0 .and. j <= this%col0 + this%cols))
+    call MPI_Allreduce(MPI_IN_PLACE, abroad, 1, MPI_INTEGER, MPI_SUM, &
+         & this%grid%comm)
+    if (abroad == 0) then
+       call set_local_${k}$(this, i - this%row0, j - this%col0, v)
+       return
+    end if
+
     np = this%grid%size
-    dest = [(band_of(i(k), this%n, this%grid%rows) * this%grid%cols + &
-         & band_of(j(k), this%n, this%grid%cols), k = 1, size(i))]
-    allocate(send_n(0:np - 1), recv_n(0:np - 1))
-    send_n = [(count(dest == p), p = 0, np - 1)]
+    allocate(dest(size(i)), send_n(0:np - 1), recv_n(0:np - 1))
+    send_n = 0
+    do k = 1, size(i)
+       dest(k) = band_of(i(k), this%n, this%grid%rows) * this%grid%cols + &
+            & band_of(j(k), this%n, this%grid%cols)
+       send_n(dest(k)) = send_n(dest(k)) + 1
+    end do
     call MPI_Alltoall(send_n, 1, MPI_INTEGER, recv_n, 1, MPI_INTEGER, &
          & this%grid%comm)
     send_at = [0, (sum(send_n(0:p - 1)), p = 1, np - 1)]
