@@ -33,6 +33,7 @@ module msp_eigen_mod
      end function msp_scalar_function
   end interface
 
+#:if defined('MSPOLY_SCALAPACK')
   interface
      integer function sys2blacs_handle(comm)
        integer, intent(in) :: comm
@@ -99,6 +100,7 @@ module msp_eigen_mod
        integer, intent(out) :: info
      end subroutine pzheevd
   end interface
+#:endif
 #:if defined('MSPOLY_GPU')
   interface
      !> Fill id with a new NCCL unique id. Returns nonzero on failure.
@@ -197,8 +199,10 @@ contains
     character(*), intent(in) :: backend
 
     select case (backend)
+#:if defined('MSPOLY_SCALAPACK')
     case ("scalapack")
        msp_dense_available = .true.
+#:endif
 #:if defined('MSPOLY_GPU')
     case ("cusolvermp")
        msp_dense_available = .true.
@@ -382,7 +386,8 @@ contains
          & scoped=.true.)
     call args%get("block", block, default=64, scoped=.true.)
     if (.not. msp_dense_available(backend)) call msp_raise("msp_eigen: " // &
-         & "backend '" // backend // "' is not built in")
+         & "backend '" // backend // "' is not built in (MsPoly needs " // &
+         & "ScaLAPACK, or cuSOLVERMp on the GPU, for the dense solvers)")
     call process_shape(A%grid%size, nprow, npcol)
     block = max(1, min(block, A%n / max(nprow, npcol)))
   end subroutine read_solver
@@ -418,9 +423,11 @@ contains
     call to_cyclic(A, block, c)
     allocate(w(A%n))
     select case (backend)
+#:if defined('MSPOLY_SCALAPACK')
     case ("scalapack")
        call msp_cite("blackford1997scalapack", info)
        call scalapack_eigh(A, c, w, present(vectors))
+#:endif
 #:if defined('MSPOLY_GPU')
     case ("cusolvermp")
        call msp_cite("nvidia_cusolvermp", info)
@@ -586,6 +593,7 @@ contains
     if (A%on_device()) call msp_to_device(V)
   end subroutine from_cyclic
 
+#:if defined('MSPOLY_SCALAPACK')
   !> w and the eigenvectors in c from ScaLAPACK's divide and conquer
   !> solver, or w alone from its eigenvalue-only solver (p?syevd and
   !> p?heevd accept only jobz = 'V'), when the eigenvectors are not wanted.
@@ -647,6 +655,7 @@ contains
     call free_blacs_system_handle(handle)
     if (status /= 0) call msp_raise("msp_eigen: ScaLAPACK failed")
   end subroutine scalapack_eigh
+#:endif
 
 #:if defined('MSPOLY_GPU')
   !> w, and the eigenvectors in c when wanted, from cuSOLVERMp's divide
