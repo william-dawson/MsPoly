@@ -127,6 +127,15 @@ Inside a program, read the same report with `info%get_logical("converged")`,
 `info%get_real("energy")` and so on. To move the calculation to the GPU, move
 the input with `msp_to_device(h)`; nothing else changes.
 
+Examples
+--------------------------------------------------------------------------------
+`examples/tblite_density` builds the GFN2-xTB core Hamiltonian and overlap of a
+molecule with [tblite](https://github.com/tblite/tblite) — each rank computing
+only the columns its MsPoly piece stores — and purifies the occupied projector
+of H C = S C E with `msp_density`. Build with `-DMSPOLY_BUILD_EXAMPLES=ON`; see
+`examples/README.md`. MsPoly stays MIT: tblite (LGPL-3.0-or-later) is only
+linked, never vendored, and mctc-lib is Apache-2.0.
+
 Feature Outline
 --------------------------------------------------------------------------------
 The following functions of a matrix are implemented, for real and complex

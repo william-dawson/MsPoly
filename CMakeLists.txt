@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 project(MsPoly VERSION 2.0.0 LANGUAGES Fortran)
 
 option(MSPOLY_BUILD_TESTS "Build and register the test suite" ON)
+option(MSPOLY_BUILD_EXAMPLES "Build the examples" OFF)
 option(MSPOLY_GPU "Compute on NVIDIA GPUs" OFF)
 option(MSPOLY_BUILD_BENCH "Build the benchmarks" OFF)
 set(MSPOLY_SCALAPACK_LIBRARIES "scalapack" CACHE STRING
@@ -44,6 +45,9 @@ add_subdirectory(src)
 include(MsPolyInstall)
 if(MSPOLY_BUILD_BENCH)
   add_subdirectory(bench)
+endif()
+if(MSPOLY_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()
 
 if(MSPOLY_BUILD_TESTS)

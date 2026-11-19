@@ -3,3 +3,6 @@
 *.o
 *.mod
 *.smod
+
+# macOS
+.DS_Store
