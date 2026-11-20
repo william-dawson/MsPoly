@@ -94,3 +94,10 @@ if(MSPOLY_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# make package_source: the source tarball that the BigDFT installer asks for.
+set(CPACK_PACKAGE_NAME "mspoly")
+set(CPACK_SOURCE_GENERATOR "TGZ")
+set(CPACK_SOURCE_PACKAGE_FILE_NAME "mspoly-${PROJECT_VERSION}")
+set(CPACK_SOURCE_IGNORE_FILES "/\\\\.git/;/\\\\.claude/;/build[^/]*/;\\\\.swp$;~$")
+include(CPack)
